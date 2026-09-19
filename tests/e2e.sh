@@ -146,6 +146,14 @@ check "profiles + shared + snippet gone" "[ ! -e $HOME/.claude-work ] && [ ! -e 
 after2=$(snap)
 check "source profile still byte-identical after rollback" "[ '$before' = '$after2' ]"
 check "backups untouched" "ls $HOME/.claude-backups/claude-*.tar.gz >/dev/null 2>&1"
+check "bashrc has no claude-profiles reference after rollback" "! grep -q 'claude-profiles' $HOME/.bashrc"
+check "bashrc still has its original PATH export line" "grep -qF 'export PATH=\$PATH' $HOME/.bashrc"
+check "a backup of bashrc exists under .claude-backups" "ls $HOME/.claude-backups/.bashrc.before-rollback-* >/dev/null 2>&1"
+
+echo "=== second rollback (no rc line left) does not fail ==="
+bash "$SCRIPT" rollback --yes > "$T/rollback2.out" 2>&1; rc=$?
+check "second rollback exits 0" "[ $rc -eq 0 ]"
+check "second rollback reports nothing to remove from rc" "grep -qi 'no claude-profiles lines found' $T/rollback2.out"
 
 echo "=== safe mode + custom names, verify without flags ==="
 bash "$SCRIPT" apply --yes --share safe --main corp --second home > "$T/apply-safe.out" 2>&1; rc=$?

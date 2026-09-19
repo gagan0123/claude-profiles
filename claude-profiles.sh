@@ -875,6 +875,7 @@ do_rollback() {
   say "  ${SECOND_DIR}"
   say "  ${SHARED}"
   say "  ${SNIPPET_FILE}"
+  say "  the source line it added to your shell rc file (backed up first)"
   say ""
   say "It does NOT touch ${SOURCE} or ~/.claude.json, which were never modified."
   say "Your backups in ${BACKUP_ROOT} are left in place."
@@ -894,7 +895,7 @@ do_rollback() {
     info "are not removed. Delete them in Keychain Access if you want."
   fi
 
-  confirm "Remove the four paths above?" || { say "aborted"; return 0; }
+  confirm "Remove the five items above?" || { say "aborted"; return 0; }
 
   for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
     same_path "$d" "$SOURCE" && die "refusing: '${d}' is the source profile"
@@ -902,8 +903,73 @@ do_rollback() {
   done
   [ -f "$SNIPPET_FILE" ] && { info "removing ${SNIPPET_FILE}"; rm -f "$SNIPPET_FILE"; }
 
+  hdr "Shell rc file"
+  local rc_summary="no shell rc file was touched"
+  local rc src_line
+  rc=$(rc_file)
+  src_line=". \"${SNIPPET_FILE}\""
+  if [ -z "$rc" ]; then
+    info "shell '${SHELL}' is not bash or zsh; nothing to check. If you added"
+    info "the source line by hand, remove it yourself."
+  elif [ ! -f "$rc" ]; then
+    info "no ${rc}; nothing to clean up"
+    rc_summary="${rc} does not exist; nothing to clean up"
+  else
+    mkdir -p "$BACKUP_ROOT"
+    chmod 700 "$BACKUP_ROOT"
+    local stamp bkp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    bkp="${BACKUP_ROOT}/$(basename "$rc").before-rollback-${stamp}"
+    cp -p "$rc" "$bkp"
+    info "backed up ${rc} to ${bkp}"
+
+    # Preserve the rc file's mode: cp -p onto the temp name first (mode
+    # carries with the copy), then truncate and refill its content. The
+    # redirection below only rewrites bytes, never the file's own mode.
+    local tmp line removed=0 have_hold=0 hold=""
+    tmp="$(dirname "$rc")/.$(basename "$rc").rollback.$$"
+    cp -p "$rc" "$tmp"
+    : > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = "$src_line" ]; then
+        if [ "$have_hold" -eq 1 ]; then
+          have_hold=0; hold=""
+          removed=$((removed+2))
+        else
+          removed=$((removed+1))
+        fi
+        continue
+      fi
+      if [ "$have_hold" -eq 1 ]; then
+        printf '%s\n' "$hold" >> "$tmp"
+        have_hold=0
+      fi
+      if [ "$line" = "# claude-profiles" ]; then
+        hold="$line"
+        have_hold=1
+        continue
+      fi
+      printf '%s\n' "$line" >> "$tmp"
+    done < "$rc"
+    if [ "$have_hold" -eq 1 ]; then
+      # A bare marker was the last line of the file: the script wrote it,
+      # so it goes too even though nothing followed it.
+      removed=$((removed+1))
+    fi
+
+    if [ "$removed" -gt 0 ]; then
+      mv "$tmp" "$rc"
+      ok "removed ${removed} line(s) from ${rc}"
+      rc_summary="removed the source line from ${rc} (backup: ${bkp})"
+    else
+      rm -f "$tmp"
+      info "no claude-profiles lines found in ${rc}; left it alone"
+      rc_summary="${rc} had no claude-profiles line to remove (backup: ${bkp})"
+    fi
+  fi
+
   say ""
-  ok "done. Remove the source line from your shell rc file by hand, then"
+  ok "done. ${rc_summary}."
   info "use plain 'claude' again, which uses ${SOURCE} as it always did."
 }
 

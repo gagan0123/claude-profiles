@@ -23,6 +23,10 @@ Open a new terminal. Plain `claude` now works again and uses `~/.claude`,
 exactly as it did before the setup. The new directories are still on disk,
 doing nothing, and you can come back to them.
 
+(Level 2 below removes this same line for you automatically, with a backup
+of the rc file taken first. Use this level only if you want to do it by hand
+without running the script.)
+
 ---
 
 ## Level 2: remove what the script created
@@ -32,8 +36,17 @@ doing nothing, and you can come back to them.
 ```
 
 Deletes `~/.claude-work`, `~/.claude-personal`, `~/.claude-shared` and
-`~/.claude-profiles.sh`. Prompts before doing it. Leaves `~/.claude`,
+`~/.claude-profiles.sh`, and removes the `# claude-profiles` marker and
+source line it added to your shell rc file (`~/.zshrc`, `~/.bashrc`, or
+`~/.bash_profile` on macOS). Prompts before doing it. Leaves `~/.claude`,
 `~/.claude.json` and your backups alone.
+
+Before it edits the rc file, it copies the untouched version to
+`~/.claude-backups/<rcfile>.before-rollback-<timestamp>` and prints that
+path, so you can always get the line back. If the rc file has no
+claude-profiles line to remove (already removed, or an unrecognised shell),
+it says so and leaves the file alone; a second rollback run is a no-op here,
+not an error.
 
 It reads the profile names you chose from
 `~/.claude-shared/.claude-profiles.conf`, so non-default names need no flags.
@@ -57,8 +70,9 @@ want those, copy them out first:
 cp -R ~/.claude-shared/projects ~/claude-sessions-keep
 ```
 
-Afterwards, remove the source line from your shell rc file by hand. The script
-does not edit your rc file on the way out.
+The script edits the rc file itself now (see the backup path it prints), so
+there is nothing left to remove by hand afterwards. Open a new terminal and
+plain `claude` works again, using `~/.claude` exactly as before the setup.
 
 ---
 
