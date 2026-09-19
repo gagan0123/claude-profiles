@@ -8,7 +8,7 @@ Contents of this bundle:
 
 | File | What it is |
 |---|---|
-| `claude-profiles.sh` | The setup script. Has `plan`, `apply`, `verify` and `rollback` modes. |
+| `claude-profiles.sh` | The setup script. Has `plan`, `apply`, `verify`, `rollback` and `finalize` modes. |
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
 | `ROLLBACK.md` | How to undo, at three levels of severity. |
@@ -37,6 +37,9 @@ claude-work                          # should already be logged in
 claude-personal                      # browser login, second account
 # quit, then:
 ./claude-profiles.sh verify
+
+# weeks later, once you trust the new setup and want the space back:
+./claude-profiles.sh finalize        # the only supported way to delete ~/.claude
 ```
 
 Useful options:
@@ -48,7 +51,8 @@ Useful options:
 --share safe     do NOT share transcripts, see below
 --source DIR     seed from a profile other than ~/.claude
 --shell          append the source line to your .zshrc / .bashrc for you
---no-backup      skip the tar archive (only sensible on a re-run of apply)
+--no-backup      skip the tar archive (only sensible on a re-run of apply; for
+                 finalize it requires an existing one instead of skipping)
 --yes            skip confirmations; required when no terminal can answer them
 ```
 
@@ -115,7 +119,8 @@ account. The script is built around avoiding that:
 1. **`~/.claude` is only ever read.** Nothing is moved, deleted, or replaced
    with a symlink inside it. If the whole setup turns out to be a mistake,
    delete the three new directories and your original profile is exactly as
-   it was.
+   it was. The one exception is `finalize`, which exists to delete it, on
+   your explicit command, after every gate below passes.
 2. **A tar backup of `~/.claude` and `~/.claude.json` is taken first**, into
    `~/.claude-backups/`, before anything is created. The archive is read back
    before the script continues; if tar fails outright, nothing else happens.
@@ -143,10 +148,11 @@ account. The script is built around avoiding that:
    backup, and `apply` refuses to start if it cannot fit.
 
 Cost of this approach: the shared data is a *copy*, so transcripts are on disk
-twice until you delete `~/.claude`. `plan` prints the sizes. Once you have
-used the new setup for a week and are happy, delete the old directory and
-reclaim the space, after checking the "settings that still point at
-~/.claude" section of `verify` (see below).
+twice until `~/.claude` goes. `plan` prints the sizes. Once you have used the
+new setup for a week and are happy, run `./claude-profiles.sh finalize` to
+reclaim the space. Do not `rm -rf ~/.claude` by hand: see
+[When you are done: finalize](#when-you-are-done-finalize) for what that
+would take out with it.
 
 ---
 
@@ -274,6 +280,79 @@ Keychain was locked at login time (typical over SSH): Claude Code then falls
 back to `.credentials.json` in the config dir, the script copies that file,
 and no prompt appears. `verify` prints how many `Claude Code` Keychain
 entries exist so you can see that each profile got its own.
+
+---
+
+## When you are done: finalize
+
+Everything up to here keeps `~/.claude` as the fallback, which means the
+transcripts are on disk twice. When you no longer want the duplicate:
+
+```bash
+./claude-profiles.sh finalize
+```
+
+This is the one command in the script whose purpose is to delete
+`~/.claude`, and the only supported way to do it. A hand-run
+`rm -rf ~/.claude` is a genuinely bad idea: it can delete the transcript of
+a session that is still running, remove a `statusLine` or hook script that
+both new profiles still point at, or run from a terminal that *is itself* a
+Claude Code session on the old profile.
+
+`finalize` checks all of that first. Eight gates, in this order, each one a
+refusal with a specific message:
+
+1. **A recorded setup exists.** `~/.claude-shared/.claude-profiles.conf` must
+   be there, and the `SOURCE` it recorded must be the directory about to be
+   deleted. Without `--source` that is `~/.claude`. If the source is already
+   gone it says so and stops.
+2. **The target is not one of the new directories.** It refuses if the source
+   resolves to either profile or the shared directory. Removing those is
+   `rollback`, not `finalize`.
+3. **A full `verify` passes.** The old profile is the fallback, so it only
+   goes once the thing replacing it is provably healthy. Any problem `verify`
+   reports stops finalize, and it prints that verify passed when it does.
+4. **No `settings.json` still points into the source.** If either profile has
+   a `statusLine`, hook or command under `~/.claude/`, deleting the directory
+   would break it. It names the file and tells you to re-run `apply` (which
+   relocates such scripts into `~/.claude-shared`) or fix the path by hand.
+5. **No session is running on the old profile.** `~/.claude/sessions/` must be
+   empty. If it is not, and `CLAUDE_CONFIG_DIR` is unset or points at the
+   source, it says explicitly that the terminal you are running this from may
+   itself be a Claude Code session on the old profile, and that finalize has
+   to be run from a `claude-<profile>` session or a plain terminal after
+   quitting it.
+6. **The profiles hold their own credentials.** The main profile must have its
+   own `.credentials.json` (or be on macOS, where the Keychain holds it) and
+   its own `.claude.json`. These are copies and deleting the source cannot
+   touch them, but a missing one means the login you meant to keep never made
+   it into the new profile and the source is still the only place it exists.
+7. **A backup exists and reads back.** It takes a fresh `tar` archive of
+   `~/.claude` and `~/.claude.json` and reads it back, exactly as `apply`
+   does. With `--no-backup` it instead requires that
+   `~/.claude-backups/.latest` names an archive that still exists and lists
+   cleanly, prints when that archive was taken, and warns that anything
+   written since is not in it.
+8. **The summary, then the confirmation.** It prints what will be deleted and
+   how large it is, which archive now holds the only copy, and which
+   directories stay. Only then does it ask, and the prompt fails closed:
+   without a terminal you need `--yes`.
+
+Because the confirmation is last, **a run without `--yes` is its own dry
+run**: every gate is checked and printed, and then it stops without deleting
+anything. That is why `plan` has no finalize mode.
+
+What it deletes: `~/.claude`, and `~/.claude.json` when the source is the
+default `~/.claude` (its copy lives in `~/.claude-<main>/.claude.json` and in
+the archive). Nothing else. It then appends `FINALIZED=<timestamp>` to the
+conf file.
+
+Afterwards `verify` keeps working and reports the source as "removed by
+finalize on \<timestamp\>" rather than missing, and skips the "Source profile
+untouched" section. `plan` and `apply` refuse with "source profile was
+removed by finalize; nothing to seed from" instead of a confusing "does not
+exist". The way back is [`ROLLBACK.md`](ROLLBACK.md) Level 3, extracting the
+archive finalize took.
 
 ---
 

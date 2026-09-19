@@ -356,6 +356,80 @@ tar xzf "$(cat "$HOME/.claude-backups/.latest")" -C "$HOME"
 after3=$(snap)
 check "restored tree matches original (names, modes, sizes, mtimes)" "[ '$before' = '$after3' ]"
 
+echo "=== finalize ==="
+# The restore section above put ~/.claude back and rolled the profiles away,
+# so build a working setup again before testing the command that deletes the
+# source profile.
+bash "$SCRIPT" apply --yes --shell > "$T/fin-apply.out" 2>&1; rc=$?
+check "finalize: fresh apply exits 0" "[ $rc -eq 0 ]"
+# finalize's gate 3 is a full verify, so the setup has to be genuinely clean
+# first: both profiles launched, holding different accounts, agreeing on
+# retention. Also drop the fixture's $HOME/.claude/hooks/missing.sh hook,
+# which apply cannot relocate (no such file) and which would otherwise trip
+# gate 4 in every case below; gate 4 is exercised deliberately further down.
+mkdir -p "$HOME/.claude-work/sessions" "$HOME/.claude-personal/sessions"
+printf '{}' > "$HOME/.claude-personal/.claude.json"
+printf '{"claudeAiOauth":{"accessToken":"FAKE-WORK"}}\n' > "$HOME/.claude-personal/.credentials.json"
+chmod 600 "$HOME/.claude-personal/.credentials.json"
+FIN_SET='{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude-shared/statusline.sh"}}'
+printf '%s\n' "$FIN_SET" > "$HOME/.claude-work/settings.json"
+printf '%s\n' "$FIN_SET" > "$HOME/.claude-personal/settings.json"
+bash "$SCRIPT" verify > "$T/fin-verify0.out" 2>&1; rc=$?
+check "finalize: baseline verify is clean" "[ $rc -eq 0 ]"
+n_arch_fin=$(ls "$HOME/.claude-backups"/*.tar.gz | wc -l)
+
+# Gate 8: the confirmation is last, so a run without --yes passes every gate
+# and then stops. That is the dry run for this command.
+bash "$SCRIPT" finalize > "$T/fin-notty.out" 2>&1 </dev/null; rc=$?
+check "finalize without --yes and no tty aborts" "[ $rc -ne 0 ] && grep -q -- '--yes' $T/fin-notty.out"
+check "finalize without --yes deleted nothing" "[ -d $HOME/.claude ] && [ -f $HOME/.claude.json ]"
+check "finalize without --yes still printed every gate it passed" "grep -q 'gate 7' $T/fin-notty.out && grep -q 'Gate 8' $T/fin-notty.out"
+
+# Gate 5: a file in the source's sessions/ means a session may be live there.
+printf '{}' > "$HOME/.claude/sessions/live.json"
+bash "$SCRIPT" finalize --yes > "$T/fin-sessions.out" 2>&1; rc=$?
+check "finalize refuses while ~/.claude/sessions has an entry" "[ $rc -ne 0 ] && grep -q 'sessions' $T/fin-sessions.out"
+check "finalize says the terminal may itself be a session on the old profile" "grep -q 'may itself be a Claude Code session' $T/fin-sessions.out"
+check "finalize: source survives the sessions refusal" "[ -d $HOME/.claude ]"
+rm -f "$HOME/.claude/sessions/live.json"
+
+# Gate 4: a settings.json still pointing into the source.
+printf '{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude/statusline.sh"}}\n' > "$HOME/.claude-personal/settings.json"
+bash "$SCRIPT" finalize --yes > "$T/fin-refs.out" 2>&1; rc=$?
+check "finalize refuses while a profile settings.json points into the source" "[ $rc -ne 0 ] && grep -qF '$HOME/.claude-personal/settings.json' $T/fin-refs.out"
+check "finalize: source survives the settings refusal" "[ -d $HOME/.claude ]"
+printf '%s\n' "$FIN_SET" > "$HOME/.claude-personal/settings.json"
+
+# Gate 3: verify itself must be clean. Break one shared link to prove it.
+rm "$HOME/.claude-work/plans"; mkdir "$HOME/.claude-work/plans"
+bash "$SCRIPT" finalize --yes > "$T/fin-broken.out" 2>&1; rc=$?
+check "finalize refuses when verify reports a problem" "[ $rc -ne 0 ] && grep -q 'verify reports problems' $T/fin-broken.out"
+check "finalize: source survives the verify refusal" "[ -d $HOME/.claude ]"
+rmdir "$HOME/.claude-work/plans"; ln -s "$HOME/.claude-shared/plans" "$HOME/.claude-work/plans"
+
+# The real thing.
+bash "$SCRIPT" finalize --yes > "$T/fin-ok.out" 2>&1; rc=$?
+check "finalize --yes exits 0" "[ $rc -eq 0 ]"
+check "finalize took a fresh backup of its own" "grep -q 'backup written and read back' $T/fin-ok.out"
+check "source profile and ~/.claude.json are gone" "[ ! -e $HOME/.claude ] && [ ! -e $HOME/.claude.json ]"
+check "profiles and shared dir are untouched" "[ -d $HOME/.claude-work ] && [ -d $HOME/.claude-personal ] && [ -d $HOME/.claude-shared ]"
+check "finalize left a new archive behind" "[ \$(ls $HOME/.claude-backups/*.tar.gz | wc -l) -gt $n_arch_fin ]"
+check ".latest names an existing archive holding the deleted tree" "[ -f \"\$(cat $HOME/.claude-backups/.latest)\" ] && tar tzf \"\$(cat $HOME/.claude-backups/.latest)\" | grep -q '^\.claude/settings.json'"
+check "conf has exactly one FINALIZED line" "[ \$(grep -c '^FINALIZED=' $HOME/.claude-shared/.claude-profiles.conf) -eq 1 ]"
+
+bash "$SCRIPT" verify > "$T/fin-verify1.out" 2>&1; rc=$?
+check "verify after finalize exits 0" "[ $rc -eq 0 ]"
+check "verify reports the source as removed by finalize, not missing" "grep -q 'removed by finalize' $T/fin-verify1.out && ! grep -q 'missing: $HOME/.claude\$' $T/fin-verify1.out"
+check "verify skips the source-untouched section" "grep -qF 'skipped: $HOME/.claude was removed by finalize' $T/fin-verify1.out"
+check "verify still runs the settings-reference section" "grep -q 'Settings that still point at' $T/fin-verify1.out"
+
+bash "$SCRIPT" plan > "$T/fin-plan.out" 2>&1; rc=$?
+check "plan after finalize dies with the finalize-specific message" "[ $rc -ne 0 ] && grep -q 'nothing to seed from' $T/fin-plan.out"
+
+bash "$SCRIPT" finalize --yes > "$T/fin-again.out" 2>&1; rc=$?
+check "second finalize exits non-zero" "[ $rc -ne 0 ] && grep -qi 'nothing to remove' $T/fin-again.out"
+check "second finalize adds no second FINALIZED line" "[ \$(grep -c '^FINALIZED=' $HOME/.claude-shared/.claude-profiles.conf) -eq 1 ]"
+
 echo
 echo "passed=$pass failed=$fail   (outputs in $T)"
 [ "$fail" -eq 0 ]

@@ -20,7 +20,10 @@ and the failure modes, and you need both.
    can revoke the stored refresh token on logout, which would sign the user
    out of the account they are trying to preserve. The whole design avoids it.
 2. **Never write to, delete from, or symlink anything inside `~/.claude`.** It
-   is the fallback if this goes wrong. Read-only, always.
+   is the fallback if this goes wrong. Read-only, always. The script's
+   `finalize` command is the one exception, and you never run it unless the
+   user asks for it by name in this conversation. Never `rm -rf ~/.claude`
+   yourself under any circumstances, and never as a "cleanup" step.
 3. **Never make `.credentials.json` or `.claude.json` a symlink.** Those two
    files being real and separate per profile is what isolates the accounts.
 4. **Do not modify `claude-profiles.sh` to work around a failure.** If it
@@ -137,14 +140,17 @@ profile should be listed. If it is not, check that
 - the backup path
 - which profile holds which account
 - the two launcher commands
-- that `~/.claude` is untouched and can be deleted later to reclaim space
+- that `~/.claude` is untouched; later, `./claude-profiles.sh finalize`
+  removes it safely (it re-runs verify, checks nothing still points into it
+  and no session is running on it, and takes a backup first); never
+  `rm -rf` it
 - the two live traps: keep `cleanupPeriodDays` identical in both
   `settings.json` files, and never resume the same session in both profiles
   at once
 - that user-scope MCP servers and per-project trust carried over into the
   main profile but not the second, which needs them set up once
-- whether `verify` warned about settings pointing at `~/.claude`, and what
-  that means for deleting it later
+- whether `verify` warned about settings pointing at `~/.claude`, and that
+  `finalize` will refuse while such a reference is still there
 - that IDE extensions do not see the shell functions and will use `~/.claude`
   unless `CLAUDE_CONFIG_DIR` is set in the IDE's own environment
 

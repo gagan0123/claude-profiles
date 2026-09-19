@@ -21,6 +21,22 @@ bug even if every test passes.
    operations on it are `cp` *from* it, `tar` *of* it, and `du`/`ls`/`test`.
    `tests/e2e.sh` fingerprints the source tree before and after every command
    and fails if a byte, mode or mtime moved. Keep it that way.
+   **The single sanctioned exception is the `finalize` command**, which
+   deletes the source outright (and `~/.claude.json` when the source is the
+   default) and is never reached from `plan`, `apply`, `verify` or
+   `rollback`; it may only do so after eight ordered gates, each a `die`:
+   the conf file records this exact source and it is still a directory; the
+   source is not `MAIN_DIR`, `SECOND_DIR` or `SHARED`; a full `do_verify`
+   returns clean; neither profile's `settings.json` still references paths
+   under the source; `${SOURCE}/sessions` is empty (and it says so when the
+   caller's own terminal may be that session); the main profile has its own
+   `.credentials.json` (or macOS) and `.claude.json`; a fresh backup was
+   taken and read back, or `--no-backup` found a `.latest` archive that
+   lists cleanly; and a confirmation, last so that a run without `--yes` is
+   its own dry run, after a summary of what goes and what stays. It then
+   records `FINALIZED=<stamp>` in the conf file, which is what lets `verify`
+   keep passing and what makes `plan`/`apply` refuse with a specific
+   message. Adding a ninth gate is fine; removing one is a bug.
 2. **`.credentials.json`, `.claude.json` and `sessions/` are per-profile real
    files, never symlinks, never shared.** The `PRIVATE` list in the script
    and the "Credential isolation" section of `verify` enforce this.
@@ -80,8 +96,10 @@ It builds a fake `$HOME` under `$TMPDIR`, seeds a fake `~/.claude`, and runs
 `plan`, an `apply` without a TTY (must abort), `apply --yes --shell`, the
 launcher functions against a stub `claude` binary, a second `apply`,
 `verify` in clean and deliberately broken states, bad-input rejection,
-`rollback`, a `--share safe` setup with custom names, and a level-3 restore
-from the backup archive. It never reads or writes the real `~/.claude`.
+`rollback`, a `--share safe` setup with custom names, a level-3 restore
+from the backup archive, and `finalize` (each gate's refusal, then the real
+deletion and the state it leaves behind). It never reads or writes the real
+`~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
 fix a bug, add the case that would have caught it first.

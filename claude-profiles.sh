@@ -10,6 +10,9 @@
 #   This script NEVER writes to, deletes from, or symlinks anything inside
 #   your existing ~/.claude directory. It only reads from it. Your current
 #   setup keeps working exactly as it does today, untouched, as a fallback.
+#   The single exception is the `finalize` command, whose whole purpose is to
+#   delete ~/.claude once you no longer want the duplicate; it runs eight
+#   gates and a confirmation first, and never runs as part of plan or apply.
 #   Everything new lives in three new directories:
 #
 #     ~/.claude-<main>     new profile, inherits your current config + login
@@ -52,6 +55,8 @@ CMD=""
 MAIN_SET=0; SECOND_SET=0; SHARE_SET=0; SOURCE_SET=0
 CONF_LOADED=0
 CONF_CLAUDE_VERSION=""
+CONF_SOURCE=""
+CONF_FINALIZED=""
 
 # Session data. "full" gives you cross-profile --resume and --continue.
 # "safe" deliberately leaves transcripts and checkpoints per-profile so that
@@ -192,6 +197,9 @@ Commands:
   apply       Create the profiles and shared directory.
   verify      Inspect the current state and report problems.
   rollback    Remove the profiles and shared dir created by this script.
+  finalize    Delete the source profile (${SOURCE}) once the new setup has
+              replaced it. IRREVERSIBLE: the only way back is the tar
+              archive it takes first. Runs eight gates and asks to confirm.
 
 Options:
   --main NAME       name of the profile that inherits your current login
@@ -205,7 +213,10 @@ Options:
   --source DIR      profile to seed from (default: ${SOURCE})
   --shell           append the launcher functions to your shell rc file
                     (without this, the snippet is written out for you to add)
-  --no-backup       skip the tar backup (only sensible on a re-run of apply)
+  --no-backup       skip the tar backup (only sensible on a re-run of apply).
+                    For finalize it does not skip the check: an existing,
+                    readable archive named by ${BACKUP_ROOT}/.latest
+                    is then required instead of a fresh one.
   --yes             skip confirmation prompts. REQUIRED when there is no
                     terminal to answer them, e.g. when run from Claude Code.
   -h, --help        this text
@@ -218,6 +229,7 @@ Examples:
   ./claude-profiles.sh plan
   ./claude-profiles.sh apply --shell
   ./claude-profiles.sh verify
+  ./claude-profiles.sh finalize      # weeks later, when you trust the setup
 EOF
 }
 
@@ -226,7 +238,7 @@ EOF
 [ $# -eq 0 ] && { usage; exit 0; }
 
 case "${1:-}" in
-  plan|apply|verify|rollback) CMD="$1"; shift ;;
+  plan|apply|verify|rollback|finalize) CMD="$1"; shift ;;
   -h|--help) usage; exit 0 ;;
   *) die "unknown command '${1}'. Try --help." ;;
 esac
@@ -259,8 +271,10 @@ if [ -f "$CONF_FILE" ]; then
       MAIN)       if [ "$MAIN_SET"   -eq 0 ]; then MAIN="$v";       fi ;;
       SECOND)     if [ "$SECOND_SET" -eq 0 ]; then SECOND="$v";     fi ;;
       SHARE_MODE) if [ "$SHARE_SET"  -eq 0 ]; then SHARE_MODE="$v"; fi ;;
-      SOURCE)     if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
+      SOURCE)     CONF_SOURCE="$v"
+                  if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
       CLAUDE_VERSION) CONF_CLAUDE_VERSION="$v" ;;
+      FINALIZED)  CONF_FINALIZED="$v" ;;
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
@@ -304,8 +318,19 @@ SNIPPET_FILE="${HOME}/.claude-profiles.sh"
 preflight() {
   hdr "Preflight"
 
-  [ -d "$SOURCE" ] || die "source profile '${SOURCE}' does not exist.
+  if [ ! -d "$SOURCE" ]; then
+    # After finalize the source is gone on purpose, and the generic "does not
+    # exist" would send someone looking for a bug. Say what happened instead.
+    if [ -n "$CONF_FINALIZED" ]; then
+      die "source profile was removed by finalize on ${CONF_FINALIZED}; nothing to seed from.
+       '${SOURCE}' no longer exists, which is what finalize is for. The
+       profiles in ${MAIN_DIR} and ${SECOND_DIR} are the setup now. To seed
+       again, restore the archive first (ROLLBACK.md, Level 3), or pass
+       --source pointing at a profile that still exists."
+    fi
+    die "source profile '${SOURCE}' does not exist.
        If you have never run Claude Code, run it once and log in first."
+  fi
   ok "source profile found: ${SOURCE}"
 
   if [ ! -e "${SOURCE}/settings.json" ] && [ ! -e "${SOURCE}/projects" ] \
@@ -850,7 +875,14 @@ do_verify() {
   hdr "Directories"
   local d
   for d in "$SOURCE" "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
-    if [ -d "$d" ]; then ok "$d"; else warn "missing: $d"; problems=$((problems+1)); fi
+    if [ -d "$d" ]; then
+      ok "$d"
+    elif [ "$d" = "$SOURCE" ] && [ -n "$CONF_FINALIZED" ]; then
+      # Gone on purpose. Not a problem, and not "missing".
+      ok "${d}  (removed by finalize on ${CONF_FINALIZED})"
+    else
+      warn "missing: $d"; problems=$((problems+1))
+    fi
   done
   if [ "$CONF_LOADED" -eq 1 ]; then
     ok "settings read from ${CONF_FILE} (main=${MAIN} second=${SECOND} share=${SHARE_MODE})"
@@ -860,17 +892,22 @@ do_verify() {
 
   hdr "Source profile untouched"
   local p touched=0
-  for p in $SHARE_ALL $PRIVATE; do
-    if [ -L "${SOURCE}/${p}" ]; then
-      case "$(readlink "${SOURCE}/${p}")" in
-        "${SHARED}"/*|"${MAIN_DIR}"/*|"${SECOND_DIR}"/*)
-          warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
-          touched=1 ;;
-      esac
-    fi
-  done
-  if [ "$touched" -eq 0 ]; then ok "nothing in ${SOURCE} points at the new directories"
-  else problems=$((problems+1)); fi
+  if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
+    info "skipped: ${SOURCE} was removed by finalize on ${CONF_FINALIZED}."
+    info "There is no source profile left to leave untouched."
+  else
+    for p in $SHARE_ALL $PRIVATE; do
+      if [ -L "${SOURCE}/${p}" ]; then
+        case "$(readlink "${SOURCE}/${p}")" in
+          "${SHARED}"/*|"${MAIN_DIR}"/*|"${SECOND_DIR}"/*)
+            warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
+            touched=1 ;;
+        esac
+      fi
+    done
+    if [ "$touched" -eq 0 ]; then ok "nothing in ${SOURCE} points at the new directories"
+    else problems=$((problems+1)); fi
+  fi
 
   hdr "Shared links"
   local dir
@@ -999,7 +1036,13 @@ do_verify() {
       refs=1
     fi
   done
-  [ "$refs" -eq 0 ] && ok "none (safe to delete ${SOURCE} later, once you are happy)"
+  if [ "$refs" -eq 0 ]; then
+    if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
+      ok "none"
+    else
+      ok "none (so 'finalize' can remove ${SOURCE} when you are ready)"
+    fi
+  fi
 
   hdr "Shell"
   local rc
@@ -1160,13 +1203,244 @@ do_rollback() {
   info "use plain 'claude' again, which uses ${SOURCE} as it always did."
 }
 
+# ---------------------------------------------------------------- finalize --
+
+record_conf_finalized() {
+  # Write FINALIZED=<stamp> into CONF_FILE, dropping any line already there so
+  # a second finalize cannot leave two of them. Portable rewrite through a
+  # temp file in the same directory, then mv: same shape as
+  # record_conf_version(), because sed -i is GNU-only.
+  local stamp="$1" tmp line
+  tmp="$(dirname "$CONF_FILE")/.$(basename "$CONF_FILE").tmp.$$"
+  : > "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      FINALIZED=*) ;;
+      *) printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONF_FILE"
+  printf 'FINALIZED=%s\n' "$stamp" >> "$tmp"
+  mv "$tmp" "$CONF_FILE"
+}
+
+do_finalize() {
+  # The one command that deletes SOURCE. Every gate below is a refusal, in a
+  # fixed order, and the confirmation is deliberately LAST: a run without
+  # --yes prints every gate it passed and then stops, so it doubles as the
+  # dry run that `plan` does not provide for this command.
+  local conf_src d vst stamp archive src_is_home entries
+
+  hdr "Finalize"
+  say "This is the only command in this script that deletes ${SOURCE}."
+  say "It runs eight gates first and asks before the deletion itself."
+
+  # -- gate 1: an apply was recorded, and this is the source it used --------
+  hdr "Gate 1: recorded setup"
+  if [ "$CONF_LOADED" -eq 0 ]; then
+    die "no ${CONF_FILE}. finalize only removes a source profile that a
+       recorded 'apply' seeded from, because that file is the only evidence
+       the new setup exists and which source it came from. Nothing deleted."
+  fi
+  if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
+    die "already finalized: ${CONF_FILE} records FINALIZED=${CONF_FINALIZED}
+       and '${SOURCE}' is gone. There is nothing to remove."
+  fi
+  if [ -n "$CONF_SOURCE" ]; then
+    conf_src="${CONF_SOURCE%/}"
+    if ! same_path "$conf_src" "$SOURCE"; then
+      die "refusing: ${CONF_FILE} records SOURCE=${conf_src}, but finalize was
+       about to remove '${SOURCE}'. Drop the --source flag, or fix the conf
+       file, so the thing deleted is the thing the setup was seeded from."
+    fi
+    ok "gate 1: ${CONF_FILE} records SOURCE=${conf_src}, which is what would be removed"
+  else
+    if ! same_path "$SOURCE" "${HOME}/.claude"; then
+      die "refusing: ${CONF_FILE} records no SOURCE, so finalize only accepts
+       the default ~/.claude, not '${SOURCE}'."
+    fi
+    ok "gate 1: no SOURCE in the conf file; '${SOURCE}' is the default ~/.claude"
+  fi
+  [ -d "$SOURCE" ] || die "'${SOURCE}' is not a directory. There is nothing to remove."
+  ok "gate 1: '${SOURCE}' exists and is a directory"
+
+  src_is_home=0
+  if same_path "$SOURCE" "${HOME}/.claude"; then src_is_home=1; fi
+
+  # -- gate 2: not one of the directories this script created ---------------
+  hdr "Gate 2: not one of the new directories"
+  for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+    if same_path "$SOURCE" "$d"; then
+      die "refusing: '${SOURCE}' resolves to '${d}', which this script created.
+       finalize removes the OLD profile, never the new ones. If you want the
+       new ones gone, that is 'rollback'."
+    fi
+  done
+  ok "gate 2: '${SOURCE}' is none of ${MAIN_DIR}, ${SECOND_DIR}, ${SHARED}"
+
+  # -- gate 3: the new setup is actually healthy ----------------------------
+  hdr "Gate 3: full verify"
+  info "${SOURCE} is the fallback, so it only goes once the replacement is clean."
+  vst=0
+  do_verify || vst=$?
+  if [ "$vst" -ne 0 ]; then
+    die "verify reports problems (above). Not deleting '${SOURCE}': while the
+       new setup is broken, the old profile is the thing you fall back to.
+       Fix what verify flagged and run finalize again."
+  fi
+  hdr "Gate 3 result"
+  ok "gate 3: verify passed with no problems"
+
+  # -- gate 4: nothing still points into the source -------------------------
+  hdr "Gate 4: no settings pointing into ${SOURCE}"
+  for d in "$MAIN_DIR" "$SECOND_DIR"; do
+    if refs_old_profile "${d}/settings.json"; then
+      warn "still pointing there: $(find_old_claude_paths "${d}/settings.json" | tr '\n' ' ')"
+      die "${d}/settings.json still references paths under ~/.claude/.
+       Deleting '${SOURCE}' would break that statusLine, hook or command.
+       Re-run 'apply' (it relocates such scripts into ${SHARED} and repoints
+       the setting), or fix the path by hand, then run finalize again."
+    fi
+  done
+  ok "gate 4: neither profile's settings.json references a path under ${SOURCE}"
+
+  # -- gate 5: no live session on the old profile ---------------------------
+  hdr "Gate 5: no session running on ${SOURCE}"
+  entries=""
+  if [ -d "${SOURCE}/sessions" ]; then
+    # Same ls -A test do_rollback uses. No pipe: a session file name is
+    # printed below through printf, not parsed here.
+    entries=$(ls -A "${SOURCE}/sessions" 2>/dev/null) || entries=""
+  fi
+  if [ -n "$entries" ]; then
+    warn "${SOURCE}/sessions is not empty:"
+    printf '%s\n' "$entries" | sed 's/^/      /' >&2
+    warn "Claude Code writes one file there per running session, so a session"
+    warn "may still be live on the old profile. Deleting it under a running"
+    warn "session loses that session's transcript."
+    if [ -z "${CLAUDE_CONFIG_DIR:-}" ] || same_path "${CLAUDE_CONFIG_DIR:-}" "$SOURCE"; then
+      warn ""
+      warn "CLAUDE_CONFIG_DIR is '${CLAUDE_CONFIG_DIR:-unset}', so the terminal"
+      warn "running this may itself be a Claude Code session on the old"
+      warn "profile. Run finalize from a claude-${MAIN} or claude-${SECOND}"
+      warn "session, or from a plain terminal after quitting that session."
+    fi
+    die "refusing: ${SOURCE}/sessions has entries. Quit the session, check
+       that ${SOURCE}/sessions is empty, then run finalize again."
+  fi
+  ok "gate 5: ${SOURCE}/sessions is empty or absent (no live session there)"
+
+  # -- gate 6: the profiles hold their own credentials ----------------------
+  hdr "Gate 6: the profiles' own credentials"
+  if [ -f "${MAIN_DIR}/.credentials.json" ]; then
+    ok "gate 6: ${MAIN_DIR}/.credentials.json is a real file of its own"
+  elif [ "$OS" = "macos" ]; then
+    ok "gate 6: no ${MAIN_DIR}/.credentials.json, which is expected on macOS"
+    info "(the Keychain entry is keyed to the config directory, so the profile"
+    info " has its own login there rather than in a file)"
+  else
+    die "${MAIN_DIR} has no .credentials.json of its own. On Linux that means
+       the '${MAIN}' profile is not carrying the login you meant to keep, and
+       '${SOURCE}' may be the only place it exists. Launch claude-${MAIN} and
+       log in (never /logout), or re-run 'apply', before finalize."
+  fi
+  if [ ! -f "${MAIN_DIR}/.claude.json" ]; then
+    die "${MAIN_DIR}/.claude.json is missing: the '${MAIN}' profile has no app
+       state of its own (onboarding, project trust, user-scope MCP servers).
+       Launch claude-${MAIN} once, or re-run 'apply', before finalize."
+  fi
+  ok "gate 6: ${MAIN_DIR}/.claude.json is present"
+  info "both are copies, so deleting ${SOURCE} cannot affect them. Checked"
+  info "anyway: a missing one means the login is not in the new profile yet."
+
+  # -- gate 7: a backup that reads back -------------------------------------
+  hdr "Gate 7: backup"
+  archive=""
+  if [ "$DO_BACKUP" -eq 1 ]; then
+    do_backup
+    archive=$(cat "${BACKUP_ROOT}/.latest" 2>/dev/null || true)
+    [ -n "$archive" ] && [ -f "$archive" ] \
+      || die "the backup did not leave a readable archive named in ${BACKUP_ROOT}/.latest. Not deleting anything."
+    ok "gate 7: fresh backup taken and read back: ${archive}"
+  else
+    info "--no-backup: requiring an archive that already exists instead."
+    [ -f "${BACKUP_ROOT}/.latest" ] \
+      || die "--no-backup given, but ${BACKUP_ROOT}/.latest does not exist, so
+       there is no recorded archive to fall back to. Re-run without
+       --no-backup and let finalize take one."
+    archive=$(cat "${BACKUP_ROOT}/.latest")
+    [ -n "$archive" ] && [ -f "$archive" ] \
+      || die "--no-backup given, and ${BACKUP_ROOT}/.latest names '${archive}',
+       which is not a file. Re-run without --no-backup."
+    tar tzf "$archive" >/dev/null 2>&1 \
+      || die "--no-backup given, and the archive named by .latest does not list
+       cleanly: ${archive}. Re-run without --no-backup."
+    stamp=$(basename "$archive" .tar.gz); stamp="${stamp#claude-}"
+    ok "gate 7: existing archive lists cleanly: ${archive}"
+    info "taken at ${stamp} (from its name), i.e. NOT during this run:"
+    info "$(ls -l "$archive")"
+    warn "anything written to ${SOURCE} since then is not in that archive."
+  fi
+
+  # -- gate 8: the summary, then the only confirmation ----------------------
+  hdr "Gate 8: what finalize is about to delete"
+  say ""
+  say "  DELETE, permanently:"
+  say "    ${SOURCE}   ($(du -sh "$SOURCE" 2>/dev/null | cut -f1) on disk)"
+  if [ "$src_is_home" -eq 1 ] && [ -f "${HOME}/.claude.json" ]; then
+    say "    ${HOME}/.claude.json   (its copy lives in ${MAIN_DIR}/.claude.json)"
+  fi
+  say ""
+  say "  held in this archive, and nowhere else afterwards:"
+  say "    ${archive}"
+  say ""
+  say "  stays, and is your setup from now on:"
+  say "    ${MAIN_DIR}     (claude-${MAIN})"
+  say "    ${SECOND_DIR}   (claude-${SECOND})"
+  say "    ${SHARED}"
+  say "    ${BACKUP_ROOT}"
+  say ""
+  warn "This is the irreversible step. Everything above it was reversible;"
+  warn "after it, the only way back to ${SOURCE} is extracting that archive"
+  warn "(ROLLBACK.md, Level 3)."
+
+  confirm "Delete ${SOURCE} permanently? There is no undo except the archive." \
+    || { say ""; say "aborted: nothing was deleted. Every gate above passed,"; \
+         say "so this run was its own dry run."; return 1; }
+
+  # -- the deletion ---------------------------------------------------------
+  hdr "Removing"
+  info "rm -rf ${SOURCE}"
+  rm -rf "$SOURCE"
+  if [ "$src_is_home" -eq 1 ] && [ -f "${HOME}/.claude.json" ]; then
+    info "rm -f ${HOME}/.claude.json"
+    rm -f "${HOME}/.claude.json"
+  fi
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  record_conf_finalized "$stamp"
+  ok "recorded FINALIZED=${stamp} in ${CONF_FILE}"
+
+  hdr "Done"
+  say "  ${SOURCE} is gone. ${MAIN_DIR} and ${SECOND_DIR} are the setup now;"
+  say "  launch them with claude-${MAIN} and claude-${SECOND} as before."
+  say "  'verify' keeps working and now reports the source as removed."
+  say ""
+  say "  The only way back is the archive:"
+  say "    ${archive}"
+  say "  Extract it as described in ROLLBACK.md, Level 3, which is now the"
+  say "  only rollback level that can restore the old profile."
+}
+
 # -------------------------------------------------------------------- main --
 
 banner() {
   say ""
   say "claude-profiles v${VERSION}   os=${OS}  share=${SHARE_MODE}"
   [ "$CONF_LOADED" -eq 1 ] && say "  (names/mode/source remembered from ${CONF_FILE}; flags override)"
-  say "  source (never modified) : ${SOURCE}"
+  if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
+    say "  source (removed by finalize on ${CONF_FINALIZED}) : ${SOURCE}"
+  else
+    say "  source (never modified) : ${SOURCE}"
+  fi
   say "  main profile            : ${MAIN_DIR}   (inherits current login)"
   say "  second profile          : ${SECOND_DIR}   (fresh login)"
   say "  shared data             : ${SHARED}"
@@ -1212,9 +1486,15 @@ case "$CMD" in
     say "  5. Confirm sharing works: start a session in one profile, then"
     say "     run  claude-${SECOND} --resume  in the same project directory."
     say ""
-    say "  ${SOURCE} is untouched and still works. Once you are happy with"
-    say "  the new setup, you can delete it to reclaim the duplicated space"
-    say "  (verify tells you if a settings file still points into it)."
+    say "  ${SOURCE} is untouched and still works, and the shared data is a"
+    say "  copy, so it is on disk twice until you remove it. When you are"
+    say "  happy with the new setup, run:"
+    say ""
+    say "      ./claude-profiles.sh finalize"
+    say ""
+    say "  That is the supported way to delete ${SOURCE}: it re-runs verify,"
+    say "  checks nothing still points into it and no session is running on"
+    say "  it, takes a fresh backup, and then asks. Do not rm -rf it by hand."
     ;;
   verify)
     banner
@@ -1223,5 +1503,10 @@ case "$CMD" in
   rollback)
     banner
     do_rollback
+    ;;
+  finalize)
+    DRY=0
+    banner
+    do_finalize
     ;;
 esac

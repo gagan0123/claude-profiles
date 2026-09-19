@@ -5,6 +5,12 @@ Three levels. Use the mildest one that fixes your problem.
 Your original `~/.claude` was never modified by the setup script, so in every
 case below it is still there and still works.
 
+**Unless you have run `finalize`.** That command deletes `~/.claude` on
+purpose, and after it Levels 1 and 2 no longer give you the old profile back
+because there is nothing left to fall back to. Level 3 is then the only way
+back, and the archive to use is the one `finalize` took immediately before
+deleting: `cat ~/.claude-backups/.latest` names it.
+
 ---
 
 ## Level 1: stop using the new profiles
@@ -78,8 +84,16 @@ plain `claude` works again, using `~/.claude` exactly as before the setup.
 
 ## Level 3: restore from the backup archive
 
-Only needed if something modified `~/.claude` despite the design, or you want
-to return to a known-good snapshot from before the setup.
+Only needed if something modified `~/.claude` despite the design, you want to
+return to a known-good snapshot from before the setup, or you ran `finalize`
+and want the old profile back.
+
+**After `finalize`, this is the only level that does anything**, and the
+archive to use is the one finalize took as its seventh gate, immediately
+before deleting: it is the newest one, and `~/.claude-backups/.latest` names
+it. `verify` and the conf file's `FINALIZED=` line tell you when that was.
+Note that `finalize` also deleted `~/.claude.json`; the archive holds it too,
+so the `tar xzf` below restores both.
 
 Find the archive:
 
@@ -100,6 +114,9 @@ tar xzf ~/.claude-backups/claude-<timestamp>.tar.gz -C "$HOME"
 
 ls -la ~/.claude
 ```
+
+After `finalize` there is nothing to move aside, so skip the two `mv` lines
+and go straight to `tar xzf`.
 
 The archive holds `.claude/` and `.claude.json` as paths relative to your
 home directory, so `-C "$HOME"` puts them back exactly where they were. Check
