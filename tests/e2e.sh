@@ -541,6 +541,149 @@ fi
 HOME="$H8" bash "$SCRIPT" plan --yes > "$T/notty-plan-yes.out" 2>&1; rc=$?
 check "--yes never asks, whatever the terminal, and takes work,personal" "[ $rc -eq 0 ] && grep -qF 'work (inherits current login), personal' $T/notty-plan-yes.out && ! grep -qi 'Easy setup' $T/notty-plan-yes.out"
 
+echo "=== add, remove, settings ==="
+# Three things this section is about, in one fake HOME of its own so that the
+# sections after it keep working against the main fixture:
+#   --settings NAME=PATH   seeding one profile's settings.json from a file
+#   add NAME[,NAME...]     extending a setup that already exists
+#   remove NAME            archiving one profile away again
+H9="$T/home_addremove"
+mkdir -p "$H9/.claude/projects/-ar-proj" "$H9/.claude/skills/x" "$H9/.claude/plans"
+printf '{"type":"user","msg":"ar"}\n' > "$H9/.claude/projects/-ar-proj/s1.jsonl"
+printf '{"display":"prompt ar"}\n' > "$H9/.claude/history.jsonl"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H9/.claude/settings.json"
+printf '# ar claude md\n' > "$H9/.claude/CLAUDE.md"
+printf 'name: x\n' > "$H9/.claude/skills/x/SKILL.md"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-first"}}\n' > "$H9/.claude/.credentials.json"
+chmod 600 "$H9/.claude/.credentials.json"
+printf '{"hasCompletedOnboarding":true}\n' > "$H9/.claude.json"
+# The seed file, and the two shapes that must be refused. cleanupPeriodDays
+# matches the source's, or verify would (rightly) flag the mismatch later.
+SEED="$T/acme-settings.json"
+printf '{"cleanupPeriodDays": 3650, "model": "opus"}\n' > "$SEED"
+printf 'cleanupPeriodDays = 3650\n' > "$T/not-json.txt"
+mkdir -p "$T/has space"
+printf '{"cleanupPeriodDays": 3650}\n' > "$T/has space/s.json"
+
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --profiles home,acme --settings "nosuch=$SEED" > "$T/ar-badname.out" 2>&1; rc=$?
+check "settings: a name outside this run's profile list is rejected" "[ $rc -ne 0 ] && grep -q nosuch $T/ar-badname.out"
+check "settings: the rejected run created nothing" "[ ! -e $H9/.claude-shared ] && [ ! -e $H9/.claude-home ] && [ ! -e $H9/.claude-backups ]"
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --profiles home,acme --settings "acme=$T/not-json.txt" > "$T/ar-badjson.out" 2>&1; rc=$?
+check "settings: a file that is not crudely JSON is rejected" "[ $rc -ne 0 ] && grep -qi 'does not look like JSON' $T/ar-badjson.out"
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --profiles home,acme --settings "acme=$T/has space/s.json" > "$T/ar-space.out" 2>&1; rc=$?
+check "settings: a path containing a space is rejected" "[ $rc -ne 0 ] && grep -qi whitespace $T/ar-space.out"
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --profiles home,acme --settings "acme=$T/no-such-file.json" > "$T/ar-nofile.out" 2>&1; rc=$?
+check "settings: a path that is not a regular file is rejected" "[ $rc -ne 0 ] && grep -q 'not a regular file' $T/ar-nofile.out"
+HOME="$H9" bash "$SCRIPT" verify --settings "acme=$SEED" > "$T/ar-verify-settings.out" 2>&1; rc=$?
+check "settings: verify does not accept --settings" "[ $rc -ne 0 ] && grep -q 'only accepted by plan, apply and add' $T/ar-verify-settings.out"
+
+HOME="$H9" bash "$SCRIPT" plan --profiles home,acme --settings "acme=$SEED" > "$T/ar-plan.out" 2>&1; rc=$?
+check "settings: plan exits 0 and names the seed file" "[ $rc -eq 0 ] && grep -qF 'copy   settings.json <- $SEED (--settings)' $T/ar-plan.out"
+check "settings: plan created nothing" "[ ! -e $H9/.claude-shared ] && [ ! -e $H9/.claude-acme ]"
+
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --profiles home,acme --settings "acme=$SEED" > "$T/ar-apply.out" 2>&1; rc=$?
+check "settings: apply exits 0" "[ $rc -eq 0 ]"
+check "settings: acme's settings.json is the --settings file" "grep -q opus $H9/.claude-acme/settings.json"
+check "settings: home's settings.json came from the source, not the seed" "! grep -q opus $H9/.claude-home/settings.json && grep -q 3650 $H9/.claude-home/settings.json"
+check "settings: nothing about the seed is recorded in the conf" "! grep -q -- '--settings' $H9/.claude-shared/.claude-profiles.conf && ! grep -qF '$SEED' $H9/.claude-shared/.claude-profiles.conf"
+printf '{"cleanupPeriodDays": 3650, "model": "sonnet"}\n' > "$T/acme-settings2.json"
+HOME="$H9" bash "$SCRIPT" apply --yes --shell --no-backup --settings "acme=$T/acme-settings2.json" > "$T/ar-apply2.out" 2>&1; rc=$?
+check "settings: a re-apply keeps the existing settings.json and says it ignored the flag" "[ $rc -eq 0 ] && grep -q 'ignored' $T/ar-apply2.out && grep -q opus $H9/.claude-acme/settings.json"
+
+HOME="$H9" bash "$SCRIPT" add globex --yes > "$T/ar-add.out" 2>&1; rc=$?
+check "add: exits 0" "[ $rc -eq 0 ]"
+check "add: the directory exists with the copied config" "[ -d $H9/.claude-globex ] && [ -f $H9/.claude-globex/settings.json ] && [ -f $H9/.claude-globex/CLAUDE.md ]"
+check "add: every shared path in the new profile is a symlink" "all_share_linked $H9/.claude-globex"
+check "add: the links point at the one shared copy" "[ \"\$(readlink $H9/.claude-globex/projects)\" = $H9/.claude-shared/projects ]"
+check "add: no credentials and no app state were copied" "[ ! -e $H9/.claude-globex/.credentials.json ] && [ ! -e $H9/.claude-globex/.claude.json ]"
+check "add: conf records the extended list" "grep -q '^PROFILES=home,acme,globex\$' $H9/.claude-shared/.claude-profiles.conf"
+check "add: conf keeps the other recorded lines" "grep -q '^SHARE_MODE=full\$' $H9/.claude-shared/.claude-profiles.conf && grep -qF 'SOURCE=$H9/.claude' $H9/.claude-shared/.claude-profiles.conf"
+check "add: snippet defines the new launcher beside the old ones" "grep -q '^claude-globex()' $H9/.claude-profiles.sh && grep -q '^claude-home()' $H9/.claude-profiles.sh"
+check "add: bashrc still sources the snippet exactly once" "[ \$(grep -c 'claude-profiles.sh' $H9/.bashrc) -eq 1 ]"
+check "add: prints the new launcher and the login instruction" "grep -q 'claude-globex' $T/ar-add.out && grep -qi 'log in with its own account' $T/ar-add.out"
+out=$(bash -c ". $H9/.claude-profiles.sh; claude-globex mcp list")
+check "add: the new launcher points at its own config dir" "[ \"$out\" = 'CFG=$H9/.claude-globex ARGS=mcp list' ]"
+
+# verify has to pass with the added profile in the list. Both fresh profiles
+# need a login of their own and a .claude.json, exactly as the three-profile
+# section arranges it.
+printf '{"claudeAiOauth":{"accessToken":"ACCT-acme"}}\n' > "$H9/.claude-acme/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-globex"}}\n' > "$H9/.claude-globex/.credentials.json"
+chmod 600 "$H9/.claude-acme/.credentials.json" "$H9/.claude-globex/.credentials.json"
+printf '{}' > "$H9/.claude-acme/.claude.json"
+printf '{}' > "$H9/.claude-globex/.claude.json"
+HOME="$H9" bash "$SCRIPT" verify > "$T/ar-verify.out" 2>&1; rc=$?
+check "add: verify exits 0 with the added profile" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/ar-verify.out"
+check "add: verify checks the added profile's account and snippet" "grep -q 'globex: globex@example.com' $T/ar-verify.out && ! grep -q 'does not define' $T/ar-verify.out"
+
+HOME="$H9" bash "$SCRIPT" add acme --yes > "$T/ar-add-dup.out" 2>&1; rc=$?
+check "add: a name already in the list is rejected" "[ $rc -ne 0 ] && grep -q 'already one of the profiles' $T/ar-add-dup.out"
+mkdir -p "$H9/.claude-priorx/projects/-p"
+printf '{"type":"user","msg":"prior"}\n' > "$H9/.claude-priorx/projects/-p/s.jsonl"
+HOME="$H9" bash "$SCRIPT" add priorx --yes > "$T/ar-add-real.out" 2>&1; rc=$?
+check "add: a directory holding real data is rejected and points at --adopt" "[ $rc -ne 0 ] && grep -q 'already holds real data' $T/ar-add-real.out && grep -q -- '--adopt' $T/ar-add-real.out"
+check "add: the rejected name never reached the conf" "! grep -q priorx $H9/.claude-shared/.claude-profiles.conf"
+check "add: the pre-existing directory was left exactly as it was" "[ -f $H9/.claude-priorx/projects/-p/s.jsonl ] && [ ! -L $H9/.claude-priorx/projects ]"
+HOME="$H9" bash "$SCRIPT" add 'bad name' --yes >/dev/null 2>&1; check "add: rejects a name with a space" "[ $? -ne 0 ]"
+HOME="$H9" bash "$SCRIPT" add >/dev/null 2>&1; check "add: rejects a missing name" "[ $? -ne 0 ]"
+HOME="$H8" bash "$SCRIPT" add extra --yes > "$T/ar-add-noconf.out" 2>&1; rc=$?
+check "add: refuses when there is no conf file" "[ $rc -ne 0 ] && grep -qi 'run .apply. first' $T/ar-add-noconf.out"
+HOME="$H8" bash "$SCRIPT" remove extra --yes >/dev/null 2>&1; check "remove: refuses when there is no conf file" "[ $? -ne 0 ]"
+
+# add with the source gone is the after-finalize case: the first profile is
+# the template. Moving ~/.claude aside is enough to reach that branch.
+mv "$H9/.claude" "$H9/.claude.away"
+HOME="$H9" bash "$SCRIPT" add late --yes > "$T/ar-add-nosource.out" 2>&1; rc=$?
+check "add: works with the source gone, and says where the config came from" "[ $rc -eq 0 ] && grep -qF 'come from the first profile instead: $H9/.claude-home' $T/ar-add-nosource.out"
+check "add: the seeded config is the first profile's, not the seed file's" "[ -f $H9/.claude-late/settings.json ] && ! grep -q opus $H9/.claude-late/settings.json && [ -f $H9/.claude-late/CLAUDE.md ]"
+HOME="$H9" bash "$SCRIPT" remove late --yes > "$T/ar-rm-late.out" 2>&1; rc=$?
+check "remove: the just-added profile goes again" "[ $rc -eq 0 ] && [ ! -e $H9/.claude-late ] && grep -q '^PROFILES=home,acme,globex\$' $H9/.claude-shared/.claude-profiles.conf"
+mv "$H9/.claude.away" "$H9/.claude"
+
+shared_files_before=$(find "$H9/.claude-shared/projects" -type f | wc -l | tr -d ' ')
+HOME="$H9" bash "$SCRIPT" remove globex --yes > "$T/ar-rm.out" 2>&1; rc=$?
+check "remove: exits 0" "[ $rc -eq 0 ]"
+check "remove: the profile directory is gone" "[ ! -e $H9/.claude-globex ]"
+RM_TAR=$(ls "$H9/.claude-backups"/claude-globex-removed-*.tar.gz 2>/dev/null | head -1)
+check "remove: the archive exists, mode 600" "[ -n '$RM_TAR' ] && [ \$(fmode '$RM_TAR') = 600 ]"
+check "remove: the archive lists the profile's settings.json" "tar tzf '$RM_TAR' | grep -q '^\.claude-globex/settings.json\$'"
+check "remove: the archive path is printed" "grep -qF '$RM_TAR' $T/ar-rm.out"
+check "remove: conf drops the name" "grep -q '^PROFILES=home,acme\$' $H9/.claude-shared/.claude-profiles.conf"
+check "remove: snippet no longer defines that launcher" "! grep -q '^claude-globex()' $H9/.claude-profiles.sh && grep -q '^claude-acme()' $H9/.claude-profiles.sh"
+check "remove: says the shared data is untouched, and it is" "grep -q 'NOT touched' $T/ar-rm.out && [ \$(find $H9/.claude-shared/projects -type f | wc -l | tr -d ' ') -eq $shared_files_before ] && [ -d $H9/.claude-shared ]"
+HOME="$H9" bash "$SCRIPT" verify > "$T/ar-verify2.out" 2>&1; rc=$?
+check "remove: verify is clean afterwards" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/ar-verify2.out"
+
+mkdir -p "$H9/.claude-acme/sessions"; printf '{}' > "$H9/.claude-acme/sessions/live.json"
+HOME="$H9" bash "$SCRIPT" remove acme --yes > "$T/ar-rm-sessions.out" 2>&1; rc=$?
+check "remove: refuses while the profile's sessions dir is not empty" "[ $rc -ne 0 ] && grep -q 'sessions is not empty' $T/ar-rm-sessions.out && [ -d $H9/.claude-acme ]"
+rm -f "$H9/.claude-acme/sessions/live.json"
+HOME="$H9" bash "$SCRIPT" remove nosuch --yes > "$T/ar-rm-nosuch.out" 2>&1; rc=$?
+check "remove: refuses a name that is not in the list" "[ $rc -ne 0 ] && grep -q 'not one of the profiles' $T/ar-rm-nosuch.out"
+
+# No --yes and no terminal: fails closed, exactly like apply. Skipped when the
+# suite itself has a controlling terminal, because the child could then open
+# /dev/tty and legitimately wait for an answer.
+if ( exec </dev/tty ) 2>/dev/null; then
+  echo "SKIP remove-without-yes check (this run has a controlling terminal)"
+else
+  HOME="$H9" bash "$SCRIPT" remove home </dev/null > "$T/ar-rm-notty.out" 2>&1; rc=$?
+  check "remove without --yes and no tty exits non-zero" "[ $rc -ne 0 ] && grep -q -- '--yes' $T/ar-rm-notty.out"
+  check "remove without --yes changed nothing" "[ -d $H9/.claude-home ] && grep -q '^PROFILES=home,acme\$' $H9/.claude-shared/.claude-profiles.conf && grep -q '^claude-home()' $H9/.claude-profiles.sh"
+  check "remove: the question for the first profile says it is the inheriting one" "grep -q 'FIRST (inheriting) profile' $T/ar-rm-notty.out"
+fi
+
+HOME="$H9" bash "$SCRIPT" remove acme --yes > "$T/ar-rm-last1.out" 2>&1; rc=$?
+check "remove: going from two profiles to one is allowed" "[ $rc -eq 0 ] && [ ! -e $H9/.claude-acme ] && grep -q '^PROFILES=home\$' $H9/.claude-shared/.claude-profiles.conf"
+HOME="$H9" bash "$SCRIPT" remove home --yes > "$T/ar-rm-last2.out" 2>&1; rc=$?
+check "remove: refuses to remove the only profile left" "[ $rc -ne 0 ] && grep -q 'only profile left' $T/ar-rm-last2.out && [ -d $H9/.claude-home ]"
+HOME="$H9" bash "$SCRIPT" verify > "$T/ar-verify3.out" 2>&1; rc=$?
+check "remove: verify still runs against a one-profile setup" "[ $rc -eq 0 ] && grep -q 'profiles=home ' $T/ar-verify3.out"
+
+HOME="$H9" bash "$SCRIPT" rollback --yes > "$T/ar-rollback.out" 2>&1; rc=$?
+check "add/remove: rollback cleans the one-profile setup up" "[ $rc -eq 0 ] && [ ! -e $H9/.claude-home ] && [ ! -e $H9/.claude-shared ] && [ ! -e $H9/.claude-profiles.sh ]"
+check "add/remove: the remove archives survive rollback" "[ -f '$RM_TAR' ]"
+
 echo "=== safe mode + custom names, verify without flags ==="
 bash "$SCRIPT" apply --yes --share safe --main corp --second home > "$T/apply-safe.out" 2>&1; rc=$?
 check "safe apply exits 0" "[ $rc -eq 0 ]"

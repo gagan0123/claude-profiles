@@ -64,6 +64,18 @@ RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 # Names whose pre-existing data this run adopts, filled in by preflight().
 ADOPTED_NAMES=""
 
+# The positional argument of `add` / `remove`, read in the command case below.
+CMD_ARG=""
+
+# --settings NAME=PATH pairs, one space-separated string because bash 3.2 has
+# no arrays and no associative arrays: "acme=/path/one clientx=/path/two".
+# That is also why a path with whitespace in it is refused at parse time.
+SETTINGS_PAIRS=""
+
+# Where make_profile() copies CONFIG_COPIED from. Empty means $SOURCE; `add`
+# points it at the first profile when finalize has already removed the source.
+TEMPLATE_DIR=""
+
 # Which options were given explicitly on the command line. Anything not given
 # explicitly falls back to the values recorded at apply time (see CONF_FILE),
 # so `verify` and `rollback` do not need the flags repeated.
@@ -320,6 +332,13 @@ Commands:
               in, each profile's account, shared data size, backup count.
   verify      Inspect the current state and report problems.
   rollback    Remove the profiles and shared dir created by this script.
+  add NAME[,NAME...]
+              Add further profiles to a setup that already exists: create
+              each directory the way apply creates a fresh profile, link the
+              shared paths, record the names and rewrite the launchers.
+  remove NAME Archive one profile's directory to ${BACKUP_ROOT}, delete it,
+              drop the name and rewrite the launchers. The shared data and
+              the other profiles are not touched.
   finalize    Delete the source profile (${SOURCE}) once the new setup has
               replaced it. IRREVERSIBLE: the only way back is the tar
               archive it takes first. Runs eight gates and asks to confirm.
@@ -344,6 +363,17 @@ Options:
                              per-profile. history.jsonl (every prompt you
                              typed) is still shared either way. See README.md.
   --source DIR      profile to seed from (default: ${SOURCE})
+  --settings NAME=PATH
+                    seed that one profile's settings.json from PATH instead
+                    of the source's copy. Repeatable, one pair per profile.
+                    Accepted by plan, apply and add. PATH must be a readable
+                    regular file that at least starts with '{' and ends with
+                    '}'; it is copied with cp -p and then goes through the
+                    same statusLine/hook relocation as any other copy. A
+                    profile that already has a settings.json keeps it, and
+                    the flag is reported as ignored for that profile. The
+                    path may not contain whitespace, and nothing about it is
+                    recorded: it is a one-time seed, not a setting.
   --shell           append the launcher functions to your shell rc file
                     (without this, the snippet is written out for you to add)
   --adopt           merge data that is ALREADY in ~/.claude-<name> into the
@@ -389,6 +419,14 @@ EOF
 
 case "${1:-}" in
   plan|apply|status|verify|rollback|finalize) CMD="$1"; shift ;;
+  add|remove)
+    # These two take a positional the option loop below would reject as an
+    # unknown option: `add NAME[,NAME...]`, `remove NAME`.
+    CMD="$1"; shift
+    case "${1:-}" in
+      ""|-*) die "'${CMD}' needs a profile name, e.g. ./claude-profiles.sh ${CMD} clientx" ;;
+    esac
+    CMD_ARG="$1"; shift ;;
   -h|--help) usage; exit 0 ;;
   *) die "unknown command '${1}'. Try --help." ;;
 esac
@@ -401,6 +439,28 @@ while [ $# -gt 0 ]; do
     --second) SECOND_ARG="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
     --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
     --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
+    --settings)
+      # NAME=PATH. The name and the file are checked later, against the
+      # profile list this run is about (preflight, or do_add). What has to be
+      # checked here, while the argument is still one shell word, is that the
+      # path holds no whitespace: the pairs are carried in one space-separated
+      # string, where a path with a space could not be told from the next pair.
+      _sv="${2:?--settings needs NAME=PATH}"
+      case "$CMD" in
+        plan|apply|add) ;;
+        *) die "--settings is only accepted by plan, apply and add, not '${CMD}'." ;;
+      esac
+      case "$_sv" in
+        *[[:space:]]*) die "--settings does not support whitespace in a path: '${_sv}'.
+       The pairs are held in one space-separated string, so a path with a
+       space in it cannot be told from the next pair. Move the file, or point
+       a symlink without spaces at it, and pass that." ;;
+        *=*) ;;
+        *) die "--settings takes NAME=PATH, got '${_sv}'" ;;
+      esac
+      SETTINGS_PAIRS="${SETTINGS_PAIRS}${SETTINGS_PAIRS:+ }${_sv}"
+      unset _sv
+      shift 2 ;;
     --shell)  DO_SHELL=1; shift ;;
     --adopt)  ADOPT=1; shift ;;
     --no-backup) DO_BACKUP=0; shift ;;
@@ -530,9 +590,19 @@ for _n in $PROFILES; do
   _seen="${_seen}${_seen:+ }${_n}"
 done
 unset _seen _n
-[ "$(profiles_count)" -ge 2 ] \
-  || die "at least two profiles are needed, got '$(profiles_csv)'. One profile
+# plan and apply build a setup, and a setup of one profile would just be
+# ~/.claude under another name. The other commands only inspect or edit a
+# setup that already exists, and `remove` may legitimately take one down to a
+# single profile, so they accept a one-name list rather than dying on the conf
+# file that remove just wrote.
+if [ "$CMD" = "plan" ] || [ "$CMD" = "apply" ]; then
+  [ "$(profiles_count)" -ge 2 ] \
+    || die "at least two profiles are needed, got '$(profiles_csv)'. One profile
        would just be ~/.claude under another name."
+else
+  [ "$(profiles_count)" -ge 1 ] \
+    || die "no profile names to work with. Pass --profiles NAME,NAME."
+fi
 
 SOURCE="${SOURCE%/}"
 SHARE_ALL="${SHARE_DATA} ${CONFIG_SHARED}"
@@ -562,6 +632,10 @@ SNIPPET_FILE="${HOME}/.claude-profiles.sh"
 
 preflight() {
   hdr "Preflight"
+
+  # Before anything is read, copied or archived: a bad --settings pair is a
+  # typo in the command line, and plan and apply should both die on it here.
+  settings_check "$PROFILES"
 
   if [ ! -d "$SOURCE" ]; then
     # After finalize the source is gone on purpose, and the generic "does not
@@ -1149,11 +1223,27 @@ make_profile() {
   hdr "Profile: ${dir}"
   run mkdir -p "$dir"
 
-  local p src
+  # TEMPLATE_DIR is only set by `add` after finalize, when there is no source
+  # left to copy settings.json and CLAUDE.md from and the first profile is the
+  # nearest thing to one. Everywhere else the source is the template, as it
+  # always was, and it is still only read.
+  local p src seed tmpl
+  tmpl="${TEMPLATE_DIR:-$SOURCE}"
   for p in $CONFIG_COPIED; do
-    src="${SOURCE}/${p}"
+    src="${tmpl}/${p}"
+    seed=""
+    if [ "$p" = "settings.json" ]; then seed=$(settings_for "$label"); fi
     if [ -e "${dir}/${p}" ]; then
-      info "keep   ${p} (already present)"
+      if [ -n "$seed" ]; then
+        # Idempotence wins: --settings seeds a profile, it does not overwrite
+        # one. Saying so is the point, or a re-apply would look like it took.
+        info "keep   ${p} (already present; --settings ${seed} ignored for '${label}')"
+      else
+        info "keep   ${p} (already present)"
+      fi
+    elif [ -n "$seed" ]; then
+      info "copy   ${p} <- ${seed} (--settings)"
+      run cp -p "$seed" "${dir}/${p}"
     elif [ -e "$src" ]; then
       info "copy   ${p}"
       run cp -Rp "$src" "${dir}/${p}"
@@ -2048,6 +2138,314 @@ do_rollback() {
   info "use plain 'claude' again, which uses ${SOURCE} as it always did."
 }
 
+# ------------------------------------------------- per-profile settings.json --
+#
+# `--settings NAME=PATH` seeds one profile's settings.json from a file of its
+# own instead of the source's copy: the usual reason is a second account that
+# needs a different model, statusLine or cleanupPeriodDays from day one.
+# Nothing about it is recorded in the conf file, because it is a one-time
+# seed and not a setting: after the copy the file is the profile's own, free
+# to diverge like any other CONFIG_COPIED file.
+
+settings_for() {
+  # $1 = a profile name. Prints the path --settings gave for it, or nothing.
+  # The prefix is held in a variable because a quoted literal inside ${x#...}
+  # is parsed differently by bash 3.2 and 4.3+, as in relocate_settings_scripts.
+  local want="$1" pair pre
+  pre="${want}="
+  for pair in $SETTINGS_PAIRS; do
+    case "$pair" in
+      "$pre"*) printf '%s' "${pair#"$pre"}"; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+settings_check() {
+  # $1 = the names --settings may mention on this run (space separated).
+  # Dies on an unknown name, a path that is not a readable regular file, or a
+  # file that is not JSON at the crudest level. The whitespace rule is
+  # enforced at parse time, where the argument is still one word.
+  local names="$1" pair name path squashed pre
+  [ -n "$SETTINGS_PAIRS" ] || return 0
+  for pair in $SETTINGS_PAIRS; do
+    name="${pair%%=*}"
+    pre="${name}="
+    path="${pair#"$pre"}"
+    valid_name "$name" \
+      || die "--settings names must be letters, digits, '_' or '-', got '${name}'"
+    if ! in_list "$name" "$names"; then
+      die "--settings names '${name}', which is not a profile this run is about.
+       This run is about: $(printf '%s' "$names" | tr ' ' ',')."
+    fi
+    [ -n "$path" ] || die "--settings ${name}= has no path after the '='."
+    [ -f "$path" ] || die "--settings ${name}=${path}: not a regular file."
+    [ -r "$path" ] || die "--settings ${name}=${path}: not readable."
+    # The crudest possible JSON check, on purpose: first non-space character
+    # '{' and last '}'. There is no jq or python dependency in this script,
+    # and a real parser written in awk would be worse than no parser at all.
+    squashed=$(tr -d '[:space:]' < "$path")
+    case "$squashed" in
+      "{"*) ;;
+      *) die "--settings ${name}=${path}: does not look like JSON. Its first
+       non-space character is not '{'. (Not parsed further: this check is
+       deliberately crude, it only catches the wrong file.)" ;;
+    esac
+    case "$squashed" in
+      *"}") ;;
+      *) die "--settings ${name}=${path}: does not look like JSON. Its last
+       non-space character is not '}'." ;;
+    esac
+    ok "--settings ${name}: settings.json will be seeded from ${path}"
+  done
+}
+
+# -------------------------------------------------- add / remove a profile --
+#
+# `apply` builds a whole setup at once. These two change the profile list of a
+# setup that already exists. Both edit the conf file in place through
+# rewrite_conf_key() rather than calling write_conf(), which knows only the
+# keys apply writes and would drop FINALIZED= (and whatever a later version
+# adds) on the floor.
+
+rewrite_conf_key() {
+  # Replace the "$1=" line of CONF_FILE with "$1=$2", keep every other line
+  # exactly as it was, and append the key if it was not there at all.
+  # Portable temp-file-then-mv in the same directory, the same shape as
+  # record_conf_version(): sed -i is GNU-only.
+  local key="$1" val="$2" tmp line wrote=0
+  tmp="$(dirname "$CONF_FILE")/.$(basename "$CONF_FILE").tmp.$$"
+  : > "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "${key}="*) printf '%s=%s\n' "$key" "$val" >> "$tmp"; wrote=1 ;;
+      *)          printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONF_FILE"
+  [ "$wrote" -eq 1 ] || printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$CONF_FILE"
+}
+
+do_add() {
+  # $1 = NAME[,NAME...]. Each new profile is created exactly as apply creates
+  # a fresh, non-inheriting one: the CONFIG_COPIED files, then
+  # relocate_settings_scripts, then one symlink per shared path. Credentials
+  # and .claude.json are never copied, so every added profile starts logged
+  # out and does its own browser login, which is the whole point of adding it.
+  local arg="$1" new="" seen="" n d from csv oifs
+
+  [ "$CONF_LOADED" -eq 1 ] \
+    || die "no ${CONF_FILE}: there is no setup to add a profile to.
+       Run 'apply' first; 'add' only extends what a recorded apply created."
+  [ -d "$SHARED" ] \
+    || die "${CONF_FILE} exists but '${SHARED}' does not. Run 'apply' first."
+
+  # Split on commas only, exactly as --profiles does, so a name with a space
+  # stays one token and is rejected below instead of becoming two profiles.
+  # valid_name has to run inside this loop, while a name is still one field:
+  # afterwards the names live in a space-separated string, where 'bad name'
+  # would silently become the two profiles 'bad' and 'name'. in_list cannot
+  # run here, because it splits its haystack on $IFS.
+  oifs="$IFS"; IFS=','
+  for n in $arg; do
+    if ! valid_name "$n"; then
+      IFS="$oifs"
+      die "profile names must be letters, digits, '_' or '-', got '${n}'"
+    fi
+    new="${new}${new:+ }${n}"
+  done
+  IFS="$oifs"
+  [ -n "$new" ] || die "'add' needs at least one name, got '${arg}'."
+
+  for n in $new; do
+    if in_list "$n" "$seen"; then
+      die "'${n}' is listed twice in '${arg}'."
+    fi
+    if in_list "$n" "$PROFILES"; then
+      die "'${n}' is already one of the profiles ($(profiles_csv)).
+       Nothing to add. 'verify' shows the state of the ones you have."
+    fi
+    seen="${seen}${seen:+ }${n}"
+
+    d=$(profile_dir "$n")
+    if same_path "$d" "$SOURCE"; then
+      die "refusing: '${d}' is the source profile '${SOURCE}'."
+    fi
+    if same_path "$d" "$SHARED"; then
+      die "refusing: '${d}' is the shared directory '${SHARED}'."
+    fi
+    if [ -e "$d" ]; then
+      [ -d "$d" ] || die "'${d}' exists and is not a directory. Move it aside first."
+      if [ -n "$(profile_real_share_paths "$d")" ]; then
+        die "'${d}' already holds real data (not symlinks) at:
+       $(profile_real_share_paths "$d" | tr '\n' ' ')
+       'add' creates a profile from scratch and will not link over that.
+       Merging existing data into ${SHARED} is what --adopt is for:
+         ./claude-profiles.sh apply --adopt --yes --profiles $(profiles_csv),${n}
+       or move '${d}' aside and run 'add' again. Nothing has been changed."
+      fi
+      if [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+        die "'${d}' already exists and is not empty. 'add' creates a profile
+       from scratch; move the directory aside and run it again."
+      fi
+    fi
+  done
+
+  hdr "Add profiles"
+  from="$SOURCE"
+  if [ ! -d "$from" ]; then
+    # After finalize there is no source. The first profile is what apply
+    # seeded from it, so it is the nearest thing to a template left.
+    from=$(profile_dir "$(first_profile)")
+    [ -d "$from" ] \
+      || die "neither the source '${SOURCE}' nor the first profile '${from}'
+       exists, so there is nothing to copy a settings.json from."
+    info "source '${SOURCE}' is gone${CONF_FINALIZED:+ (finalize on ${CONF_FINALIZED})}, so"
+    info "       settings.json, CLAUDE.md and the rest of the copied config"
+    info "       come from the first profile instead: ${from}"
+  else
+    info "config copied from ${SOURCE}, which is only ever read"
+  fi
+  TEMPLATE_DIR="$from"
+
+  settings_check "$new"
+
+  csv=$(printf '%s' "$new" | tr ' ' ',')
+  say ""
+  say "  adding ${csv} to $(profiles_csv):"
+  for n in $new; do
+    say "    $(profile_dir "$n")     (claude-${n}, starts logged out)"
+  done
+  say "  ${SHARED} is only linked to, never copied again."
+  say "  ${CONF_FILE} and ${SNIPPET_FILE} are rewritten to match."
+  say "  ${SOURCE} is not touched."
+
+  confirm "Create the profile(s) above?" || { say "aborted: nothing was changed."; return 1; }
+
+  for n in $new; do
+    make_profile "$(profile_dir "$n")" "$n" "no"
+  done
+
+  PROFILES="${PROFILES} ${new}"
+  rewrite_conf_key PROFILES "$(profiles_csv)"
+  ok "${CONF_FILE} now records PROFILES=$(profiles_csv)"
+
+  write_snippet
+
+  hdr "Next steps"
+  say "  New launchers:"
+  for n in $new; do
+    say "    claude-${n}"
+  done
+  say ""
+  say "  1. Open a NEW terminal, so the launcher functions load."
+  say "  2. Run each new launcher and log in with its own account when the"
+  say "     browser opens. Do NOT run /logout, in any profile, at any point."
+  say "  3. Run:  ./claude-profiles.sh verify"
+}
+
+do_remove() {
+  # $1 = NAME. Archives the whole profile directory (it holds credentials and
+  # app state that exist nowhere else), deletes it, and drops the name from
+  # the conf file and the launcher snippet. The shared data is deliberately
+  # left alone: the other profiles are still using it, and the transcripts
+  # written under this profile are in it.
+  local name="$1" d archive parent base st=0 left="" ad="" tok n q oifs
+
+  [ "$CONF_LOADED" -eq 1 ] \
+    || die "no ${CONF_FILE}: there is no recorded setup to remove a profile
+       from. Run 'apply' first."
+  valid_name "$name" \
+    || die "profile names must be letters, digits, '_' or '-', got '${name}'"
+  in_list "$name" "$PROFILES" \
+    || die "'${name}' is not one of the profiles ($(profiles_csv)). Nothing removed."
+  [ "$(profiles_count)" -ge 2 ] \
+    || die "'${name}' is the only profile left. Removing it would leave a
+       setup with no profiles at all, which is 'rollback', not 'remove'."
+
+  d=$(profile_dir "$name")
+  archive="${BACKUP_ROOT}/claude-${name}-removed-${RUN_STAMP}.tar.gz"
+
+  hdr "Remove profile: ${name}"
+  say "  directory : ${d}"
+  say "  archive   : ${archive}"
+  say "  launcher  : claude-${name} (dropped from ${SNIPPET_FILE})"
+  say ""
+  say "  ${SHARED} is NOT touched: the transcripts, history and skills this"
+  say "  profile used are shared, and the other profiles still use them."
+  say "  ${SOURCE} is not touched either."
+  warn "the profile's own credentials and .claude.json go with the directory."
+  warn "They are in the archive, and nowhere else afterwards."
+
+  if [ -d "${d}/sessions" ] && [ -n "$(ls -A "${d}/sessions" 2>/dev/null)" ]; then
+    warn "${d}/sessions is not empty: Claude Code writes one file there per"
+    warn "running session, so a session may still be live in this profile."
+    die "refusing: quit that session, check ${d}/sessions is empty, then run
+       remove again. Nothing was changed."
+  fi
+
+  q="Remove '${name}', archive and delete ${d}?"
+  if [ "$name" = "$(first_profile)" ]; then
+    warn "'${name}' is the FIRST profile: the one apply gave the login and app"
+    warn "state copied from ${SOURCE}. Removing it leaves that login only in"
+    warn "${SOURCE} (if it still exists) and in the archive below."
+    q="'${name}' is the FIRST (inheriting) profile, the one carrying the login copied from ${SOURCE}. Remove it anyway, archive and delete ${d}?"
+  fi
+  confirm "$q" || { say "aborted: nothing was changed."; return 1; }
+
+  if [ -d "$d" ]; then
+    parent=$(dirname "$d")
+    base=$(basename "$d")
+    hdr "Archive"
+    info "archive:  ${archive}"
+    info "contents: ${d} (the whole directory, symlinks as symlinks)"
+    info "mode 600, in a mode 700 directory: the archive contains credentials"
+    archive_tree "$archive" -C "$parent" "$base" || st=$?
+    if [ "$st" -eq 90 ]; then
+      die "the archive does not read back cleanly: ${archive}. Nothing removed."
+    elif [ "$st" -ne 0 ]; then
+      die "the archive FAILED (tar exit ${st}). See ${archive}.log. Nothing removed."
+    fi
+    ok "archive written and read back ($(du -sh "$archive" | cut -f1))"
+    same_path "$d" "$SOURCE" && die "refusing: '${d}' is the source profile"
+    same_path "$d" "$SHARED" && die "refusing: '${d}' is the shared directory"
+    info "removing ${d}"
+    rm -rf "$d"
+  else
+    archive=""
+    info "${d} does not exist; only the recorded list and the snippet change."
+  fi
+
+  for n in $PROFILES; do
+    if [ "$n" != "$name" ]; then left="${left}${left:+ }${n}"; fi
+  done
+  PROFILES="$left"
+  rewrite_conf_key PROFILES "$(profiles_csv)"
+  if [ -n "$CONF_ADOPTED" ]; then
+    # ADOPTED is a comma-separated list of names, so it is split on commas.
+    oifs="$IFS"; IFS=','
+    for tok in $CONF_ADOPTED; do
+      if [ "$tok" != "$name" ]; then ad="${ad}${ad:+,}${tok}"; fi
+    done
+    IFS="$oifs"
+    rewrite_conf_key ADOPTED "$ad"
+  fi
+  ok "${CONF_FILE} now records PROFILES=$(profiles_csv)"
+
+  write_snippet
+
+  hdr "Done"
+  say "  '${name}' is gone, and ${SHARED} was not touched."
+  if [ -n "$archive" ]; then
+    say "  Its whole directory, credentials included, is in:"
+    say "    ${archive}"
+    say "  Extract it beside the others to put the profile back."
+  fi
+  say "  Remaining profiles: $(profiles_english claude- and)"
+  say "  Open a new terminal, or re-source ${SNIPPET_FILE}, so the removed"
+  say "  launcher stops being defined in shells that already loaded it."
+}
+
 # ---------------------------------------------------------------- finalize --
 
 record_conf_finalized() {
@@ -2394,6 +2792,16 @@ case "$CMD" in
   rollback)
     banner
     do_rollback
+    ;;
+  add)
+    DRY=0
+    banner
+    do_add "$CMD_ARG"
+    ;;
+  remove)
+    DRY=0
+    banner
+    do_remove "$CMD_ARG"
     ;;
   finalize)
     DRY=0
