@@ -194,6 +194,129 @@ bash "$SCRIPT" plan --main x --second x >/dev/null 2>&1; check "rejects main == 
 bash "$SCRIPT" plan --source "$HOME/.claude-shared" >/dev/null 2>&1; check "rejects source == shared" "[ $? -ne 0 ]"
 bash "$SCRIPT" plan --share nope >/dev/null 2>&1; check "rejects bad share mode" "[ $? -ne 0 ]"
 
+echo "=== edge cases ==="
+
+# -- 1. --source pointing at a directory other than ~/.claude ---------------
+AS="$T/altsrc"
+H1="$T/home_altsrc"
+mkdir -p "$H1" "$AS/projects/-altproj"
+printf '{"type":"user","msg":"altsrc session"}\n' > "$AS/projects/-altproj/s1.jsonl"
+printf '{"cleanupPeriodDays": 30}\n' > "$AS/settings.json"
+printf '{"claudeAiOauth":{"accessToken":"ALTSRC"}}\n' > "$AS/.credentials.json"
+chmod 600 "$AS/.credentials.json"
+HOME="$H1" bash "$SCRIPT" apply --yes --shell --source "$AS" > "$T/apply-altsrc.out" 2>&1; rc=$?
+check "altsrc: apply exits 0" "[ $rc -eq 0 ]"
+check "altsrc: backup archive lists altsrc/settings.json" "tar tzf $H1/.claude-backups/claude-*.tar.gz | grep -q '^altsrc/settings.json'"
+check "altsrc: shared projects copy came from altsrc" "grep -q 'altsrc session' $H1/.claude-shared/projects/-altproj/s1.jsonl"
+check "altsrc: main profile credentials came from altsrc" "grep -q ALTSRC $H1/.claude-work/.credentials.json"
+check "altsrc: conf records SOURCE" "grep -qF 'SOURCE=$AS' $H1/.claude-shared/.claude-profiles.conf"
+HOME="$H1" bash "$SCRIPT" verify > "$T/verify-altsrc.out" 2>&1; rc=$?
+check "altsrc: verify exits 0" "[ $rc -eq 0 ]"
+
+# -- 2. backup failure aborts before any change ------------------------------
+H2="$T/home_backupfail"
+mkdir -p "$H2/.claude"
+printf '{"cleanupPeriodDays": 30}\n' > "$H2/.claude/settings.json"
+printf 'orig-content\n' > "$H2/.bashrc"
+: > "$H2/.claude-backups"   # a regular FILE where a directory must go: mkdir -p fails
+HOME="$H2" bash "$SCRIPT" apply --yes > "$T/apply-backupfail.out" 2>&1; rc=$?
+check "backup failure: apply exits non-zero" "[ $rc -ne 0 ]"
+check "backup failure: no shared dir created" "[ ! -e $H2/.claude-shared ]"
+check "backup failure: no work dir created" "[ ! -e $H2/.claude-work ]"
+check "backup failure: no personal dir created" "[ ! -e $H2/.claude-personal ]"
+check "backup failure: bashrc not modified" "[ \"\$(cat $H2/.bashrc)\" = 'orig-content' ]"
+
+# -- 3. stale partial copy cleanup -------------------------------------------
+H3="$T/home_stale"
+mkdir -p "$H3/.claude/projects/-fake-proj"
+printf '{"type":"user","msg":"hi3"}\n' > "$H3/.claude/projects/-fake-proj/s1.jsonl"
+printf '{"cleanupPeriodDays": 30}\n' > "$H3/.claude/settings.json"
+mkdir -p "$H3/.claude-shared/.projects.partial"
+printf 'junk\n' > "$H3/.claude-shared/.projects.partial/junkfile"
+HOME="$H3" bash "$SCRIPT" apply --yes > "$T/apply-stale.out" 2>&1; rc=$?
+check "stale partial: apply exits 0" "[ $rc -eq 0 ]"
+check "stale partial: output mentions stale partial" "grep -q 'stale partial' $T/apply-stale.out"
+check "stale partial: .partial dir is gone" "[ ! -e $H3/.claude-shared/.projects.partial ]"
+check "stale partial: real session file present in shared projects" "[ -f $H3/.claude-shared/projects/-fake-proj/s1.jsonl ]"
+
+# -- 4. dangling shared link detection (main fixture) ------------------------
+rm -rf "$HOME/.claude-shared/plans"
+bash "$SCRIPT" verify > "$T/verify-dangling.out" 2>&1; rc=$?
+check "dangling link: verify exits non-zero" "[ $rc -ne 0 ]"
+check "dangling link: verify mentions dangling" "grep -q 'dangling' $T/verify-dangling.out"
+mkdir -p "$HOME/.claude-shared/plans"
+bash "$SCRIPT" verify > "$T/verify-dangling-fixed.out" 2>&1; rc=$?
+check "dangling link: verify clean once target exists again" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify-dangling-fixed.out"
+
+# -- 5. source-profile invariant: a symlink INSIDE the fake ~/.claude -------
+# pointing into ~/.claude-shared. This writes into the FIXTURE's ~/.claude
+# (never the real one) to prove verify catches the one thing the script
+# itself must never do. "rules" is in SHARE_ALL and does not already exist
+# under $C, so it does not collide with anything the fixture set up earlier.
+# Creating and removing an entry bumps $C's own mtime, which the final
+# fingerprint compares at minute precision; save and restore it (touch -r
+# is in both GNU and BSD touch).
+touch -r "$C" "$T/c-mtime.ref"
+ln -s "$HOME/.claude-shared/rules" "$C/rules"
+bash "$SCRIPT" verify > "$T/verify-srcinvariant.out" 2>&1; rc=$?
+check "source invariant: verify exits non-zero" "[ $rc -ne 0 ]"
+check "source invariant: verify mentions symlink INTO" "grep -qi 'symlink INTO' $T/verify-srcinvariant.out"
+rm -f "$C/rules"; touch -r "$T/c-mtime.ref" "$C"
+bash "$SCRIPT" verify > "$T/verify-srcinvariant-fixed.out" 2>&1; rc=$?
+check "source invariant: verify clean after removing the stray symlink" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify-srcinvariant-fixed.out"
+
+# -- 6. zsh: same three snippet behaviours the bash block checked -----------
+if command -v zsh >/dev/null 2>&1; then
+  zout=$(zsh -c ". $HOME/.claude-profiles.sh; claude --version" 2>&1); zrc=$?
+  check "zsh: bare claude blocked" "[ $zrc -ne 0 ] && printf '%s' \"$zout\" | grep -q 'Pick a profile'"
+  zout2=$(PATH="$T/bin:$PATH" zsh -c ". $HOME/.claude-profiles.sh; claude-work --resume x")
+  check "zsh: claude-work sets CLAUDE_CONFIG_DIR and passes args" "[ \"$zout2\" = 'CFG=$HOME/.claude-work ARGS=--resume x' ]"
+  zout3=$(PATH="$T/bin:$PATH" CLAUDE_CONFIG_DIR=/elsewhere zsh -c ". $HOME/.claude-profiles.sh; claude mcp list")
+  check "zsh: bare claude passes through when CLAUDE_CONFIG_DIR set" "[ \"$zout3\" = 'CFG=/elsewhere ARGS=mcp list' ]"
+else
+  echo "SKIP zsh not installed"
+fi
+
+# rc file selection follows $SHELL's basename, not the shell tests/e2e.sh runs under.
+H4="$T/home_zshrc"
+mkdir -p "$H4/.claude"
+printf '{"cleanupPeriodDays": 30}\n' > "$H4/.claude/settings.json"
+HOME="$H4" SHELL=/bin/zsh bash "$SCRIPT" apply --yes --shell > "$T/apply-zshrc.out" 2>&1; rc=$?
+check "SHELL=zsh: apply exits 0" "[ $rc -eq 0 ]"
+check "SHELL=zsh: source line landed in .zshrc" "[ -f $H4/.zshrc ] && grep -qF '$H4/.claude-profiles.sh' $H4/.zshrc"
+check "SHELL=zsh: .bashrc was not created" "[ ! -e $H4/.bashrc ]"
+
+H5="$T/home_fishrc"
+mkdir -p "$H5/.claude"
+printf '{"cleanupPeriodDays": 30}\n' > "$H5/.claude/settings.json"
+HOME="$H5" SHELL=/usr/bin/fish bash "$SCRIPT" apply --yes --shell > "$T/apply-fish.out" 2>&1; rc=$?
+check "SHELL=fish: apply still exits 0" "[ $rc -eq 0 ]"
+check "SHELL=fish: no rc file written" "[ ! -e $H5/.bashrc ] && [ ! -e $H5/.zshrc ]"
+check "SHELL=fish: output tells user to add the line by hand" "grep -q 'Add this line to your rc file yourself' $T/apply-fish.out"
+
+# -- 7. rollback refuses when --source names one of its own targets ---------
+bash "$SCRIPT" rollback --yes --source "$HOME/.claude-shared" > "$T/rollback-badsource.out" 2>&1; rc=$?
+check "rollback --source=shared: exits non-zero" "[ $rc -ne 0 ]"
+check "rollback --source=shared: shared still exists" "[ -d $HOME/.claude-shared ]"
+check "rollback --source=shared: work still exists (guard fires before any rm)" "[ -d $HOME/.claude-work ]"
+check "rollback --source=shared: personal still exists (guard fires before any rm)" "[ -d $HOME/.claude-personal ]"
+
+# -- 8. --main/--second name validation --------------------------------------
+bash "$SCRIPT" plan --main 'a.b' >/dev/null 2>&1; check "rejects name with a dot" "[ $? -ne 0 ]"
+bash "$SCRIPT" plan --main 'w-2' >/dev/null 2>&1; check "accepts name with hyphen and digits" "[ $? -eq 0 ]"
+
+# -- 9. cleanupPeriodDays: differing whitespace must not cause a false mismatch
+WORK_SETTINGS="$HOME/.claude-work/settings.json"
+PERSONAL_SETTINGS="$HOME/.claude-personal/settings.json"
+work_settings_orig=$(cat "$WORK_SETTINGS")
+personal_settings_orig=$(cat "$PERSONAL_SETTINGS")
+printf '{"cleanupPeriodDays" :  14}\n' > "$WORK_SETTINGS"
+printf '{"cleanupPeriodDays":14}\n' > "$PERSONAL_SETTINGS"
+bash "$SCRIPT" verify > "$T/verify-cleanup-ws.out" 2>&1; rc=$?
+check "cleanupPeriodDays: differing whitespace, same value, no mismatch warning" "[ $rc -eq 0 ] && ! grep -q 'These differ' $T/verify-cleanup-ws.out"
+printf '%s\n' "$work_settings_orig" > "$WORK_SETTINGS"
+printf '%s\n' "$personal_settings_orig" > "$PERSONAL_SETTINGS"
+
 echo "=== rollback --yes ==="
 bash "$SCRIPT" rollback --yes > "$T/rollback.out" 2>&1; rc=$?
 check "rollback exits 0" "[ $rc -eq 0 ]"
