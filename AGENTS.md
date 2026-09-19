@@ -29,7 +29,7 @@ bug even if every test passes.
    source is not `MAIN_DIR`, `SECOND_DIR` or `SHARED`; a full `do_verify`
    returns clean; neither profile's `settings.json` still references paths
    under the source; `${SOURCE}/sessions` is empty (and it says so when the
-   caller's own terminal may be that session); the main profile has its own
+   caller's own terminal may be that session); the first profile has its own
    `.credentials.json` (or macOS) and `.claude.json`; a fresh backup was
    taken and read back, or `--no-backup` found a `.latest` archive that
    lists cleanly; and a confirmation, last so that a run without `--yes` is
@@ -66,7 +66,9 @@ The script targets **bash 3.2**, because that is what `/bin/bash` is on
 macOS, and the **BSD userland**, because that is what macOS ships. Concretely:
 
 - No arrays, no `[[ ]]`, no `${var,,}`, no `mapfile`, no `declare -A`, no
-  `printf -v`, no `read -d`, no `+=` on strings you rely on.
+  `printf -v`, no `read -d`, no `+=` on strings you rely on. The profile
+  list itself is carried as a single space-separated string (`PROFILES`),
+  never an array, for the same reason: bash 3.2 has no arrays.
 - `readlink` **without** `-f`. `realpath` does not exist on older macOS.
   Use `cd dir && pwd -P` to canonicalise.
 - `stat` flags differ completely between GNU and BSD. The script does not
@@ -101,11 +103,12 @@ It builds a fake `$HOME` under `$TMPDIR`, seeds a fake `~/.claude`, and runs
 `plan`, an `apply` without a TTY (must abort), `apply --yes --shell`, the
 launcher functions against a stub `claude` binary, a second `apply`,
 `verify` in clean and deliberately broken states, bad-input rejection,
-`rollback`, an `--adopt` run against a pre-existing second profile (refusal
+`rollback`, an `--adopt` run against a pre-existing fresh profile (refusal
 without the flag, archive, no-overwrite merge, history union, `.adopted-*`),
-a `--share safe` setup with custom names, a level-3 restore from the backup
-archive, and `finalize` (each gate's refusal, then the real deletion and
-the state it leaves behind). It never reads or writes the real `~/.claude`.
+a `--share safe` setup with custom names, a three-profile setup, a level-3
+restore from the backup archive, and `finalize` (each gate's refusal, then
+the real deletion and the state it leaves behind). It never reads or writes
+the real `~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
 fix a bug, add the case that would have caught it first.
@@ -128,7 +131,7 @@ if the docs move.
   <https://code.claude.com/docs/en/authentication#credential-management>
 - `cleanupPeriodDays` sweeps `projects/`, `file-history/`, `plans/`,
   `paste-cache/`, `image-cache/`, `uploads/`, `session-env/`, `tasks/`, so
-  the two profiles must agree on it. `todos/` is legacy and not written.
+  every profile must agree on it. `todos/` is legacy and not written.
 - `/logout` "removes and revokes the credential", which is why the setup
   never asks anyone to log out.
 

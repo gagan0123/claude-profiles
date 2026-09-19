@@ -99,6 +99,13 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
     echo '{"loggedIn": false, "authMethod": "none"}'
     exit 1
   fi
+  # ACCT-<word> gives a distinct identity per profile, which the
+  # three-profile section needs; the two fixed tokens below predate it.
+  acct=$(sed -n 's/.*"accessToken":"ACCT-\([A-Za-z0-9]*\)".*/\1/p' "$creds")
+  if [ -n "$acct" ]; then
+    echo "{\"loggedIn\": true, \"authMethod\": \"claude.ai\", \"email\": \"$acct@example.com\", \"orgName\": \"Org $acct\", \"subscriptionType\": \"max\"}"
+    exit 0
+  fi
   if grep -q FAKE-WORK "$creds" 2>/dev/null; then
     echo '{"loggedIn": true, "authMethod": "claude.ai", "email": "work@example.com", "orgName": "Work Org", "subscriptionType": "team"}'
     exit 0
@@ -432,13 +439,115 @@ check "rollback after adopt exits 0" "[ $rc -eq 0 ]"
 check "rollback after adopt removed both profiles and the shared dir" "[ ! -e $HOME/.claude-work ] && [ ! -e $P ] && [ ! -e $HOME/.claude-shared ]"
 check "the adopt archive survives rollback" "[ -f '$ADOPT_TAR' ]"
 
+echo "=== three profiles ==="
+# Everything above uses the default pair, so two could still be special by
+# accident. This section builds a three-profile setup in a fake HOME of its
+# own and checks each place that used to name MAIN and SECOND: the profile
+# directories, who inherits the login, the links, the snippet, the conf file,
+# the Accounts pairing and rollback.
+H6="$T/home_three"
+mkdir -p "$H6/.claude/projects/-three-proj" "$H6/.claude/skills/x" "$H6/.claude/plans"
+printf '{"type":"user","msg":"three"}\n' > "$H6/.claude/projects/-three-proj/s1.jsonl"
+printf '{"display":"prompt three"}\n' > "$H6/.claude/history.jsonl"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H6/.claude/settings.json"
+printf 'name: x\n' > "$H6/.claude/skills/x/SKILL.md"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-first"}}\n' > "$H6/.claude/.credentials.json"
+chmod 600 "$H6/.claude/.credentials.json"
+printf '{"hasCompletedOnboarding":true}\n' > "$H6/.claude.json"
+
+HOME="$H6" bash "$SCRIPT" apply --yes --shell --profiles home,acme,globex > "$T/three-apply.out" 2>&1; rc=$?
+check "three: apply exits 0" "[ $rc -eq 0 ]"
+check "three: all three profile dirs exist" "[ -d $H6/.claude-home ] && [ -d $H6/.claude-acme ] && [ -d $H6/.claude-globex ]"
+check "three: only the first profile inherits the credentials" "[ -f $H6/.claude-home/.credentials.json ] && [ ! -e $H6/.claude-acme/.credentials.json ] && [ ! -e $H6/.claude-globex/.credentials.json ]"
+check "three: only the first profile inherits .claude.json" "[ -f $H6/.claude-home/.claude.json ] && [ ! -e $H6/.claude-acme/.claude.json ] && [ ! -e $H6/.claude-globex/.claude.json ]"
+check "three: every profile has all 17 shared links" "all_share_linked $H6/.claude-home && all_share_linked $H6/.claude-acme && all_share_linked $H6/.claude-globex"
+check "three: a later profile's link points at the one shared copy" "[ \"\$(readlink $H6/.claude-globex/projects)\" = $H6/.claude-shared/projects ]"
+check "three: snippet defines one launcher per profile" "grep -q '^claude-home()' $H6/.claude-profiles.sh && grep -q '^claude-acme()' $H6/.claude-profiles.sh && grep -q '^claude-globex()' $H6/.claude-profiles.sh"
+check "three: guard lists all three launchers" "grep -qF 'Pick a profile: claude-home, claude-acme or claude-globex' $H6/.claude-profiles.sh"
+check "three: header comment names each profile" "grep -qF 'Launchers defined here: claude-home, claude-acme and claude-globex' $H6/.claude-profiles.sh"
+out=$(bash -c ". $H6/.claude-profiles.sh; claude-globex mcp list")
+check "three: the third launcher points at its own config dir" "[ \"$out\" = 'CFG=$H6/.claude-globex ARGS=mcp list' ]"
+CONF6="$H6/.claude-shared/.claude-profiles.conf"
+check "three: conf records the list comma-separated" "grep -q '^PROFILES=home,acme,globex\$' $CONF6"
+check "three: conf no longer carries MAIN=/SECOND=" "! grep -q '^MAIN=' $CONF6 && ! grep -q '^SECOND=' $CONF6"
+
+# Accounts: give the two fresh profiles logins of their own. Each needs a
+# .claude.json too, or profile_launched() skips it (and rightly so).
+printf '{"claudeAiOauth":{"accessToken":"ACCT-acme"}}\n' > "$H6/.claude-acme/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-globex"}}\n' > "$H6/.claude-globex/.credentials.json"
+chmod 600 "$H6/.claude-acme/.credentials.json" "$H6/.claude-globex/.credentials.json"
+printf '{}' > "$H6/.claude-acme/.claude.json"
+printf '{}' > "$H6/.claude-globex/.claude.json"
+HOME="$H6" bash "$SCRIPT" verify > "$T/three-verify.out" 2>&1; rc=$?
+check "three: verify with three distinct accounts exits 0" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/three-verify.out"
+check "three: verify reports every profile's account" "grep -q 'home: first@example.com' $T/three-verify.out && grep -q 'acme: acme@example.com' $T/three-verify.out && grep -q 'globex: globex@example.com' $T/three-verify.out"
+check "three: verify reports retention for every profile" "grep -q 'home: cleanupPeriodDays=3650' $T/three-verify.out && grep -q 'globex: cleanupPeriodDays=3650' $T/three-verify.out"
+
+# Any PAIR sharing an account is a problem, not just the first two.
+cp "$H6/.claude-acme/.credentials.json" "$H6/.claude-globex/.credentials.json"
+HOME="$H6" bash "$SCRIPT" verify > "$T/three-verify-dup.out" 2>&1; rc=$?
+check "three: a same-account pair among three profiles is flagged" "[ $rc -ne 0 ] && grep -qi 'same account' $T/three-verify-dup.out"
+check "three: the warning names the pair, not the first two" "grep -q 'acme and globex are both logged in' $T/three-verify-dup.out"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-globex"}}\n' > "$H6/.claude-globex/.credentials.json"
+chmod 600 "$H6/.claude-globex/.credentials.json"
+
+# Retention has to agree across ALL of them, not just a pair.
+printf '{"cleanupPeriodDays": 7}\n' > "$H6/.claude-globex/settings.json"
+HOME="$H6" bash "$SCRIPT" verify > "$T/three-verify-ret.out" 2>&1; rc=$?
+check "three: one odd cleanupPeriodDays out of three is flagged and named" "[ $rc -ne 0 ] && grep -q 'These differ: globex' $T/three-verify-ret.out"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H6/.claude-globex/settings.json"
+
+# The deprecated aliases, against a conf that holds three names.
+HOME="$H6" bash "$SCRIPT" plan --main a --second b > "$T/three-dep.out" 2>&1; rc=$?
+check "deprecated --main/--second still work" "[ $rc -eq 0 ] && grep -qi 'deprecated' $T/three-dep.out"
+check "deprecated --main X --second Y means exactly --profiles X,Y" "grep -qF 'a (inherits current login), b' $T/three-dep.out && ! grep -q 'claude-globex' $T/three-dep.out"
+HOME="$H6" bash "$SCRIPT" plan --main solo > "$T/three-main-only.out" 2>&1; rc=$?
+check "deprecated --main alone replaces only the first position" "[ $rc -eq 0 ] && grep -qF 'solo (inherits current login), acme, globex' $T/three-main-only.out"
+
+HOME="$H6" bash "$SCRIPT" plan --profiles onlyone >/dev/null 2>&1; check "rejects a one-name --profiles" "[ $? -ne 0 ]"
+HOME="$H6" bash "$SCRIPT" plan --profiles a,a >/dev/null 2>&1; check "rejects duplicate names in --profiles" "[ $? -ne 0 ]"
+HOME="$H6" bash "$SCRIPT" plan --profiles 'a,bad name' >/dev/null 2>&1; check "rejects a --profiles name with a space" "[ $? -ne 0 ]"
+HOME="$H6" bash "$SCRIPT" plan --profiles a,b --main c >/dev/null 2>&1; check "rejects --profiles combined with --main" "[ $? -ne 0 ]"
+HOME="$H6" bash "$SCRIPT" plan --source "$H6/.claude-globex" >/dev/null 2>&1; check "rejects a source that is the LAST profile's own dir" "[ $? -ne 0 ]"
+
+HOME="$H6" bash "$SCRIPT" rollback --yes > "$T/three-rollback.out" 2>&1; rc=$?
+check "three: rollback exits 0" "[ $rc -eq 0 ]"
+check "three: rollback lists every profile dir" "grep -qF '$H6/.claude-acme' $T/three-rollback.out"
+check "three: rollback removed all three profiles and the shared dir" "[ ! -e $H6/.claude-home ] && [ ! -e $H6/.claude-acme ] && [ ! -e $H6/.claude-globex ] && [ ! -e $H6/.claude-shared ]"
+
+# A conf file written by an older version: MAIN=/SECOND= must still drive the
+# run, which is what keeps an existing setup working with no flags.
+H7="$T/home_oldconf"
+mkdir -p "$H7/.claude" "$H7/.claude-shared"
+printf '{"cleanupPeriodDays": 30}\n' > "$H7/.claude/settings.json"
+{ printf 'VERSION=1.2.0\nMAIN=x\nSECOND=y\nSHARE_MODE=full\n'
+  printf 'SOURCE=%s\n' "$H7/.claude"; } > "$H7/.claude-shared/.claude-profiles.conf"
+HOME="$H7" bash "$SCRIPT" verify > "$T/oldconf-verify.out" 2>&1
+check "old conf: MAIN=/SECOND= is read as the profile list" "grep -qF 'x (inherits current login), y' $T/oldconf-verify.out && grep -q 'profiles=x,y' $T/oldconf-verify.out"
+
+# No flags, no conf, no terminal: the question must never be asked, and the
+# default pair is used silently. Skipped when the suite itself is run from a
+# terminal, because the child could then open /dev/tty and legitimately ask.
+H8="$T/home_notty"
+mkdir -p "$H8/.claude"
+printf '{"cleanupPeriodDays": 30}\n' > "$H8/.claude/settings.json"
+if ( exec </dev/tty ) 2>/dev/null; then
+  echo "SKIP no-tty prompt check (this run has a controlling terminal)"
+else
+  HOME="$H8" bash "$SCRIPT" plan </dev/null > "$T/notty-plan.out" 2>&1; rc=$?
+  check "no flags, no conf, no tty: plan does not ask and takes work,personal" "[ $rc -eq 0 ] && grep -qF 'work (inherits current login), personal' $T/notty-plan.out && ! grep -qi 'Easy setup' $T/notty-plan.out"
+  check "no flags, no conf, no tty: plan still created nothing" "[ ! -e $H8/.claude-shared ] && [ ! -e $H8/.claude-work ]"
+fi
+HOME="$H8" bash "$SCRIPT" plan --yes > "$T/notty-plan-yes.out" 2>&1; rc=$?
+check "--yes never asks, whatever the terminal, and takes work,personal" "[ $rc -eq 0 ] && grep -qF 'work (inherits current login), personal' $T/notty-plan-yes.out && ! grep -qi 'Easy setup' $T/notty-plan-yes.out"
+
 echo "=== safe mode + custom names, verify without flags ==="
 bash "$SCRIPT" apply --yes --share safe --main corp --second home > "$T/apply-safe.out" 2>&1; rc=$?
 check "safe apply exits 0" "[ $rc -eq 0 ]"
 check "safe: projects NOT linked" "[ ! -e $HOME/.claude-corp/projects ] && [ ! -e $HOME/.claude-shared/projects ]"
 check "safe: history linked" "[ -L $HOME/.claude-corp/history.jsonl ]"
 bash "$SCRIPT" verify > "$T/verify-safe.out" 2>&1; rc=$?
-check "verify w/o flags picks up safe+names from conf" "grep -q 'main=corp second=home share=safe' $T/verify-safe.out && ! grep -q 'projects is missing' $T/verify-safe.out"
+check "verify w/o flags picks up safe+names from conf" "grep -q 'profiles=corp,home share=safe' $T/verify-safe.out && ! grep -q 'projects is missing' $T/verify-safe.out"
 # 'home' never inherited a login and has never been launched: the Accounts
 # section must skip it rather than run `claude auth status`, which would
 # create a .claude.json there as a side effect (see profile_auth() in

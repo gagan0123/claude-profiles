@@ -41,11 +41,11 @@ without running the script.)
 ./claude-profiles.sh rollback
 ```
 
-Deletes `~/.claude-work`, `~/.claude-personal`, `~/.claude-shared` and
-`~/.claude-profiles.sh`, and removes the `# claude-profiles` marker and
-source line it added to your shell rc file (`~/.zshrc`, `~/.bashrc`, or
-`~/.bash_profile` on macOS). Prompts before doing it. Leaves `~/.claude`,
-`~/.claude.json` and your backups alone.
+Deletes every `~/.claude-<name>` directory in the conf's `PROFILES` list,
+plus `~/.claude-shared` and `~/.claude-profiles.sh`, and removes the
+`# claude-profiles` marker and source line it added to your shell rc file
+(`~/.zshrc`, `~/.bashrc`, or `~/.bash_profile` on macOS). Prompts before
+doing it. Leaves `~/.claude`, `~/.claude.json` and your backups alone.
 
 Before it edits the rc file, it copies the untouched version to
 `~/.claude-backups/<rcfile>.before-rollback-<timestamp>` and prints that
@@ -56,7 +56,7 @@ not an error.
 
 It reads the profile names you chose from
 `~/.claude-shared/.claude-profiles.conf`, so non-default names need no flags.
-If that file is gone, pass `--main NAME --second NAME` yourself. It refuses
+If that file is gone, pass `--profiles NAME,NAME,...` yourself. It refuses
 to remove a directory that turns out to be the source profile.
 
 If there is no terminal to answer the prompt (running it from Claude Code,
@@ -64,7 +64,7 @@ for instance) it stops and asks for `--yes`. It also warns if a profile's
 `sessions/` directory is non-empty, which usually means a Claude Code session
 is still running there. Quit it first.
 
-On macOS the Keychain entries the two profiles created stay behind. They are
+On macOS the Keychain entries the profiles created stay behind. They are
 harmless; delete them in Keychain Access (search for "Claude Code") if you
 want a clean slate.
 

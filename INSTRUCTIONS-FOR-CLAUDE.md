@@ -6,8 +6,9 @@ Claude, not to you.
 
 ---
 
-You are setting up two Claude Code profiles on this machine so a work account
-and a personal account can run side by side, sharing session history. The
+You are setting up two or more Claude Code profiles on this machine so
+separate accounts (work and personal, or one per client) can run side by
+side, sharing session history. The
 bundle in this directory contains `claude-profiles.sh`, `README.md` and
 `ROLLBACK.md`.
 
@@ -55,18 +56,27 @@ Flag it if: the OS is not Darwin or Linux; `~/.claude` does not exist;
 size of `~/.claude` (the script's preflight repeats this check with exact
 numbers, and `apply` refuses to start if the copy plus backup cannot fit).
 
-**Step 2. Confirm the sharing mode.** Ask the user to pick `full` or `safe`
-and summarise the trade-off from the README's "Choose your sharing mode"
-section in two sentences. `full` shares transcripts and gives cross-account
-`--resume`; `safe` keeps transcripts per-account for confidentiality reasons.
-Do not pick for them.
+**Step 2. Confirm the profiles and the sharing mode.** Ask the user whether
+the easy setup (`work`, `personal`) fits, or whether they want their own
+list — for example, one profile per client. If they want a custom list,
+collect the names and say back which one keeps the current login: it is
+always the first name, and it is whichever account they are logged into
+right now. Then ask them to pick `full` or `safe` and summarise the
+trade-off from the README's "Choose your sharing mode" section in two
+sentences. `full` shares transcripts and gives cross-account `--resume`;
+`safe` keeps transcripts per-account for confidentiality reasons. Do not
+pick either for them.
 
 **Step 3. Dry run.**
 
 ```bash
 chmod +x ./claude-profiles.sh
-./claude-profiles.sh plan --share <their choice>
+./claude-profiles.sh plan --profiles <their list> --share <their choice>
 ```
+
+Always pass `--profiles` explicitly, even for the easy setup (`work,personal`):
+the interactive prompt the script would otherwise show cannot be answered
+from your Bash tool, which has no terminal.
 
 Show the user the output. Summarise in plain language what will be created and
 confirm out loud that `~/.claude` appears nowhere as a write target (only as
@@ -92,7 +102,7 @@ add `--adopt` to the Step 4 command. Do not add it on your own initiative.
 **Step 4. Apply.** Only after the approval in Step 3:
 
 ```bash
-./claude-profiles.sh apply --share <their choice> --shell --yes
+./claude-profiles.sh apply --profiles <their list> --share <their choice> --shell --yes
 ```
 
 Add `--adopt` to that command if, and only if, Step 3 turned up pre-existing
@@ -113,11 +123,14 @@ archived. That is harmless and the script says so.
 browser and a terminal the user controls. Give them these instructions:
 
 - Open a new terminal.
-- Run `claude-work`. On Linux it should already be signed in as the current
-  account. On macOS it **will** ask for a login, because the Keychain entry
-  is keyed to the config directory and none exists yet for `~/.claude-work`.
-  Log in with the **same** account. It is a login, not a logout.
-- Quit, run `claude-personal`, and log in with the **other** account.
+- Run the launcher for the first profile named (`claude-work` in the easy
+  setup). On Linux it should already be signed in as the current account. On
+  macOS it **will** ask for a login, because the Keychain entry is keyed to
+  the config directory and none exists yet for that profile. Log in with the
+  **same** account. It is a login, not a logout.
+- Quit, then for each remaining profile in turn: run its launcher
+  (`claude-personal`, then any further `claude-<name>`) and log in with that
+  profile's own account. Quit before moving to the next one.
 - Come back here.
 
 **Step 6. Verify.**
@@ -129,12 +142,12 @@ browser and a terminal the user controls. Give them these instructions:
 No flags needed: it reads the names and sharing mode from
 `~/.claude-shared/.claude-profiles.conf`. Read every warning. The section
 that matters most is "Per-profile app state (.claude.json)". If it reports
-that the **second** profile has been launched but has no `.claude.json`,
-**stop**. That means this Claude Code version keeps OAuth state at
-`~/.claude.json`, shared between both profiles, and the accounts are not
+that a **fresh** profile (any but the first) has been launched but has no
+`.claude.json`, **stop**. That means this Claude Code version keeps OAuth
+state at `~/.claude.json`, shared by every profile, and the accounts are not
 isolated. Point the user at the README section "If verify flags .claude.json"
-and do not proceed. (The main profile received a copy of `.claude.json` at
-setup, so its presence proves nothing; the second profile's does.)
+and do not proceed. (The first profile received a copy of `.claude.json` at
+setup, so its presence proves nothing; a fresh profile's does.)
 
 The "Settings that still point at ~/.claude" section is informational:
 `apply` already relocates a `statusLine` command or hook path under
@@ -144,8 +157,8 @@ reference this section still flags means that script did not exist under
 `apply` (safe to repeat) or repoint the setting by hand.
 
 Quote the "Accounts" section back to the user: it names which email each
-launched profile is actually logged in as, which is the only real proof the
-two profiles hold different accounts.
+launched profile is actually logged in as, which is the only real proof that
+no two profiles hold the same account.
 
 **Step 7. Prove the sharing works.** In a project directory the user has used
 before, have them run `claude-work`, send one message, quit, then run
@@ -157,14 +170,14 @@ profile should be listed. If it is not, check that
 **Step 8. Report.** Tell the user, concisely:
 
 - the backup path
-- which profile holds which account
-- the two launcher commands
+- which profile holds which account, for each profile set up
+- every launcher command
 - that `~/.claude` is untouched; later, `./claude-profiles.sh finalize`
   removes it safely (it re-runs verify, checks nothing still points into it
   and no session is running on it, and takes a backup first); never
   `rm -rf` it
 - the two live traps: keep `cleanupPeriodDays` identical in both
-  `settings.json` files, and never resume the same session in both profiles
+  `settings.json` files, and never resume the same session in two profiles
   at once
 - that user-scope MCP servers and per-project trust carried over into the
   main profile but not the second, which needs them set up once

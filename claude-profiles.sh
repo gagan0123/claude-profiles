@@ -2,9 +2,9 @@
 #
 # claude-profiles.sh
 #
-# Sets up two isolated Claude Code profiles (e.g. work + personal) on one
-# machine that SHARE session transcripts, prompt history, checkpoints, skills
-# and plugins, while keeping credentials completely separate.
+# Sets up any number of isolated Claude Code profiles (e.g. work + personal)
+# on one machine that SHARE session transcripts, prompt history, checkpoints,
+# skills and plugins, while keeping credentials completely separate.
 #
 # SAFETY MODEL
 #   This script NEVER writes to, deletes from, or symlinks anything inside
@@ -13,10 +13,10 @@
 #   The single exception is the `finalize` command, whose whole purpose is to
 #   delete ~/.claude once you no longer want the duplicate; it runs eight
 #   gates and a confirmation first, and never runs as part of plan or apply.
-#   Everything new lives in three new directories:
+#   Everything new lives in one directory per profile, plus one shared one:
 #
-#     ~/.claude-<main>     new profile, inherits your current config + login
-#     ~/.claude-<second>   new profile, logs in as the second account
+#     ~/.claude-<first>    new profile, inherits your current config + login
+#     ~/.claude-<name>     one more per further profile, each a fresh login
 #     ~/.claude-shared     the single copy of shared session data + skills
 #
 # Read README.md before running. Run `plan` first; it changes nothing.
@@ -34,12 +34,16 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="2.0.0"
 
 # ---------------------------------------------------------------- defaults --
 
-MAIN="work"
-SECOND="personal"
+# The profile list is a space-separated string, not an array: bash 3.2 has no
+# arrays worth the name. The FIRST entry is the profile that inherits the
+# current login and app state; every other one starts empty. The conf file
+# stores the same list comma-separated, which is also how --profiles takes it.
+DEFAULT_PROFILES="work personal"
+PROFILES="$DEFAULT_PROFILES"
 SOURCE="${HOME}/.claude"
 SHARED="${HOME}/.claude-shared"
 BACKUP_ROOT="${HOME}/.claude-backups"
@@ -54,18 +58,18 @@ CMD=""
 # directory it came from carry the same name.
 RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 
-# Filled in by preflight(): the SHARE_ALL paths that already exist as real
-# (non-symlink) data inside each profile directory, one per line. Empty in the
-# normal case of a fresh setup.
-ADOPT_PATHS_MAIN=""
-ADOPT_PATHS_SECOND=""
+# Names whose pre-existing data this run adopts, filled in by preflight().
 ADOPTED_NAMES=""
 
 # Which options were given explicitly on the command line. Anything not given
 # explicitly falls back to the values recorded at apply time (see CONF_FILE),
 # so `verify` and `rollback` do not need the flags repeated.
-MAIN_SET=0; SECOND_SET=0; SHARE_SET=0; SOURCE_SET=0
+PROFILES_SET=0; MAIN_SET=0; SECOND_SET=0; SHARE_SET=0; SOURCE_SET=0
+PROFILES_ARG=""; MAIN_ARG=""; SECOND_ARG=""
 CONF_LOADED=0
+CONF_PROFILES=""
+CONF_MAIN=""
+CONF_SECOND=""
 CONF_CLAUDE_VERSION=""
 CONF_SOURCE=""
 CONF_FINALIZED=""
@@ -136,6 +140,58 @@ confirm() {
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+ask_profiles() {
+  # Only ever reached from plan/apply, with a usable /dev/tty, no --profiles,
+  # --main or --second, no conf file and no --yes: see the resolution block
+  # below. Sets PROFILES. Reads /dev/tty like confirm() does, and dies rather
+  # than looping if the terminal stops answering, so it still fails closed.
+  local reply count name picked i
+
+  say ""
+  say "Each profile is a separate Claude Code login with its own credentials,"
+  say "launched by its own claude-<name> command. They share transcripts,"
+  say "history and skills. The FIRST profile keeps the login you are using"
+  say "now; every other one starts empty and does a fresh browser login."
+  printf '\n%s ' "Easy setup with $(profiles_english claude- and)? [Y/n]"
+  read -r reply </dev/tty || die "could not read from the terminal. Pass --profiles NAME,NAME instead."
+  case "$reply" in
+    n|N|no|NO|No) ;;
+    *) return 0 ;;
+  esac
+
+  count=""
+  while :; do
+    printf '%s ' "How many profiles? [2-9]"
+    read -r count </dev/tty || die "could not read from the terminal. Pass --profiles NAME,NAME instead."
+    case "$count" in
+      [2-9]) break ;;
+      *) say "  Enter a whole number from 2 to 9." ;;
+    esac
+  done
+
+  say ""
+  say "  The first name is the profile that keeps your current login."
+  picked=""
+  i=1
+  while [ "$i" -le "$count" ]; do
+    printf '%s ' "Name for profile ${i} (launcher will be claude-<name>):"
+    read -r name </dev/tty || die "could not read from the terminal. Pass --profiles NAME,NAME instead."
+    if ! valid_name "$name"; then
+      say "  Letters, digits, '_' and '-' only. Try again."
+      continue
+    fi
+    if in_list "$name" "$picked"; then
+      say "  '${name}' is already taken. Try again."
+      continue
+    fi
+    picked="${picked}${picked:+ }${name}"
+    i=$((i+1))
+  done
+  PROFILES="$picked"
+  say ""
+  say "  Using: $(profiles_english claude- and)"
+}
+
 kb_h() {
   # kilobytes -> human readable, portable awk only
   awk -v k="${1:-0}" 'BEGIN {
@@ -190,6 +246,46 @@ valid_name() {
   return 0
 }
 
+in_list() {
+  local needle="$1" hay="$2" x
+  for x in $hay; do
+    if [ "$x" = "$needle" ]; then return 0; fi
+  done
+  return 1
+}
+
+# -------------------------------------------------------- the profile list --
+#
+# Everything below treats PROFILES as an ordered, space-separated list of
+# names. There are no arrays in bash 3.2, so a directory is derived from a
+# name rather than stored, and "the first profile" is a function, not a slot.
+
+profile_dir() { printf '%s' "${HOME}/.claude-${1}"; }
+
+first_profile() {
+  local n
+  for n in $PROFILES; do printf '%s' "$n"; return 0; done
+}
+
+profiles_csv() { printf '%s' "$PROFILES" | tr ' ' ','; }
+
+profiles_count() { printf '%s' "$PROFILES" | wc -w | tr -d ' '; }
+
+profiles_english() {
+  # "claude-work or claude-personal", "claude-a, claude-b or claude-c".
+  # $1 is a prefix put in front of every name (empty for bare names);
+  # $2 is the final conjunction, "or" unless something else is asked for.
+  local pre="${1:-}" conj="${2:-or}" n i=0 total out=""
+  total=$(profiles_count)
+  for n in $PROFILES; do
+    i=$((i+1))
+    if [ "$i" -eq 1 ]; then out="${pre}${n}"
+    elif [ "$i" -eq "$total" ]; then out="${out} ${conj} ${pre}${n}"
+    else out="${out}, ${pre}${n}"; fi
+  done
+  printf '%s' "$out"
+}
+
 rc_file() {
   case "${SHELL##*/}" in
     zsh)  printf '%s' "${HOME}/.zshrc" ;;
@@ -215,9 +311,19 @@ Commands:
               archive it takes first. Runs eight gates and asks to confirm.
 
 Options:
-  --main NAME       name of the profile that inherits your current login
-                    (default: ${MAIN}, so ~/.claude-${MAIN})
-  --second NAME     name of the second profile (default: ${SECOND})
+  --profiles LIST   comma-separated profile names, at least two, e.g.
+                    --profiles work,personal,clientx
+                    (default: $(printf '%s' "$DEFAULT_PROFILES" | tr ' ' ','))
+                    The FIRST name is the profile that inherits your current
+                    login and app state, so ~/.claude-<first> takes over from
+                    ${SOURCE}. Every other one starts empty and does a
+                    fresh browser login. Names get the claude- prefix only in
+                    the launcher functions and directory names.
+  --main NAME       deprecated alias for the first entry of --profiles
+  --second NAME     deprecated alias for the second entry of --profiles
+                    Given together they mean --profiles NAME,NAME. Either one
+                    alone replaces just that position. Neither may be combined
+                    with --profiles.
   --share MODE      full | safe   (default: ${SHARE_MODE})
                       full = share transcripts, history, checkpoints, skills
                       safe = share plans/skills only, transcripts stay
@@ -243,13 +349,18 @@ Options:
                     terminal to answer them, e.g. when run from Claude Code.
   -h, --help        this text
 
-After a successful apply, --main/--second/--share/--source are remembered in
+With none of --profiles/--main/--second and no conf file, plan and apply ask
+at the terminal which profiles you want, offering the default pair. Without a
+terminal, or with --yes, they take the default silently.
+
+After a successful apply, --profiles/--share/--source are remembered in
 ~/.claude-shared/.claude-profiles.conf, so verify and rollback do not need
 them repeated. Explicit flags always win over the remembered values.
 
 Examples:
   ./claude-profiles.sh plan
   ./claude-profiles.sh apply --shell
+  ./claude-profiles.sh apply --profiles work,personal,clientx --shell
   ./claude-profiles.sh verify
   ./claude-profiles.sh finalize      # weeks later, when you trust the setup
 EOF
@@ -267,8 +378,10 @@ esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --main)   MAIN="${2:?--main needs a name}";   MAIN_SET=1;   shift 2 ;;
-    --second) SECOND="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
+    --profiles) PROFILES_ARG="${2:?--profiles needs a comma-separated list}"
+                PROFILES_SET=1; shift 2 ;;
+    --main)   MAIN_ARG="${2:?--main needs a name}";     MAIN_SET=1;   shift 2 ;;
+    --second) SECOND_ARG="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
     --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
     --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
     --shell)  DO_SHELL=1; shift ;;
@@ -287,12 +400,16 @@ case "$(uname -s)" in
 esac
 
 # Remembered settings from a previous apply. Explicit flags override.
+# PROFILES= is the current spelling; MAIN=/SECOND= is what versions up to
+# 1.2.0 wrote, and is still read (as the first two positions) so an existing
+# setup keeps working with no flags. write_conf() rewrites it as PROFILES=.
 CONF_FILE="${SHARED}/.claude-profiles.conf"
 if [ -f "$CONF_FILE" ]; then
   while IFS='=' read -r k v; do
     case "$k" in
-      MAIN)       if [ "$MAIN_SET"   -eq 0 ]; then MAIN="$v";       fi ;;
-      SECOND)     if [ "$SECOND_SET" -eq 0 ]; then SECOND="$v";     fi ;;
+      PROFILES)   CONF_PROFILES=$(printf '%s' "$v" | tr ',' ' ') ;;
+      MAIN)       CONF_MAIN="$v" ;;
+      SECOND)     CONF_SECOND="$v" ;;
       SHARE_MODE) if [ "$SHARE_SET"  -eq 0 ]; then SHARE_MODE="$v"; fi ;;
       SOURCE)     CONF_SOURCE="$v"
                   if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
@@ -302,6 +419,10 @@ if [ -f "$CONF_FILE" ]; then
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
+  if [ -z "$CONF_PROFILES" ]; then
+    CONF_PROFILES="${CONF_MAIN}${CONF_MAIN:+ }${CONF_SECOND}"
+    CONF_PROFILES="${CONF_PROFILES% }"
+  fi
 fi
 
 case "$SHARE_MODE" in
@@ -310,20 +431,88 @@ case "$SHARE_MODE" in
   *) die "--share must be 'full' or 'safe', got '${SHARE_MODE}'" ;;
 esac
 
-valid_name "$MAIN"   || die "--main must be letters, digits, '_' or '-', got '${MAIN}'"
-valid_name "$SECOND" || die "--second must be letters, digits, '_' or '-', got '${SECOND}'"
-[ "$MAIN" = "$SECOND" ] && die "--main and --second must differ"
+# -- which profiles this run is about ----------------------------------------
+# Precedence: --profiles, then --main/--second over whatever the conf file or
+# the built-in default supplies, then the conf file, then the interactive
+# question, then the default. The question is only asked when there is nothing
+# else to go on AND a terminal to ask at: see ask_profiles().
+if [ "$PROFILES_SET" -eq 1 ]; then
+  if [ "$MAIN_SET" -eq 1 ] || [ "$SECOND_SET" -eq 1 ]; then
+    die "--profiles cannot be combined with --main/--second. --main X --second Y
+       is just the deprecated spelling of --profiles X,Y."
+  fi
+  # Split on commas only, so a name containing a space is still one token and
+  # is rejected below instead of quietly becoming two profiles.
+  _oifs="$IFS"; IFS=','; _pl=""
+  for _n in $PROFILES_ARG; do
+    valid_name "$_n" \
+      || die "--profiles names must be letters, digits, '_' or '-', got '${_n}'"
+    _pl="${_pl}${_pl:+ }${_n}"
+  done
+  IFS="$_oifs"
+  PROFILES="$_pl"
+  unset _oifs _pl _n
+else
+  PROFILES="${CONF_PROFILES:-$DEFAULT_PROFILES}"
+  if [ "$MAIN_SET" -eq 1 ] || [ "$SECOND_SET" -eq 1 ]; then
+    warn "--main/--second are deprecated; use --profiles NAME,NAME instead."
+    if [ "$MAIN_SET" -eq 1 ]; then
+      valid_name "$MAIN_ARG" \
+        || die "--main must be letters, digits, '_' or '-', got '${MAIN_ARG}'"
+    fi
+    if [ "$SECOND_SET" -eq 1 ]; then
+      valid_name "$SECOND_ARG" \
+        || die "--second must be letters, digits, '_' or '-', got '${SECOND_ARG}'"
+    fi
+    if [ "$MAIN_SET" -eq 1 ] && [ "$SECOND_SET" -eq 1 ]; then
+      # Both given: that is the whole list, exactly as --profiles X,Y.
+      PROFILES="${MAIN_ARG} ${SECOND_ARG}"
+    else
+      # One given: it replaces just its own position in whatever list the
+      # conf file or the default supplies, and the rest stand.
+      _pl=""; _i=0
+      for _n in $PROFILES; do
+        _i=$((_i+1))
+        if [ "$_i" -eq 1 ] && [ "$MAIN_SET"   -eq 1 ]; then _n="$MAIN_ARG";   fi
+        if [ "$_i" -eq 2 ] && [ "$SECOND_SET" -eq 1 ]; then _n="$SECOND_ARG"; fi
+        _pl="${_pl}${_pl:+ }${_n}"
+      done
+      if [ "$_i" -lt 2 ] && [ "$SECOND_SET" -eq 1 ]; then
+        _pl="${_pl}${_pl:+ }${SECOND_ARG}"
+      fi
+      PROFILES="$_pl"
+      unset _pl _i _n
+    fi
+  elif [ "$CONF_LOADED" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] \
+       && { [ "$CMD" = "plan" ] || [ "$CMD" = "apply" ]; } && have_tty; then
+    ask_profiles
+  fi
+fi
+
+_seen=""
+for _n in $PROFILES; do
+  valid_name "$_n" || die "profile names must be letters, digits, '_' or '-', got '${_n}'"
+  if in_list "$_n" "$_seen"; then
+    die "profile names must all differ; '${_n}' is listed twice."
+  fi
+  _seen="${_seen}${_seen:+ }${_n}"
+done
+unset _seen _n
+[ "$(profiles_count)" -ge 2 ] \
+  || die "at least two profiles are needed, got '$(profiles_csv)'. One profile
+       would just be ~/.claude under another name."
 
 SOURCE="${SOURCE%/}"
-MAIN_DIR="${HOME}/.claude-${MAIN}"
-SECOND_DIR="${HOME}/.claude-${SECOND}"
 SHARE_ALL="${SHARE_DATA} ${CONFIG_SHARED}"
 
-for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
-  if same_path "$SOURCE" "$d"; then
+for d in $PROFILES; do
+  if same_path "$SOURCE" "$(profile_dir "$d")"; then
     die "source '${SOURCE}' is one of the directories this script manages. Refusing."
   fi
 done
+if same_path "$SOURCE" "$SHARED"; then
+  die "source '${SOURCE}' is one of the directories this script manages. Refusing."
+fi
 
 # The app-state file that belongs to SOURCE. With CLAUDE_CONFIG_DIR unset,
 # Claude Code keeps it at ~/.claude.json, next to (not inside) ~/.claude.
@@ -348,9 +537,9 @@ preflight() {
     if [ -n "$CONF_FINALIZED" ]; then
       die "source profile was removed by finalize on ${CONF_FINALIZED}; nothing to seed from.
        '${SOURCE}' no longer exists, which is what finalize is for. The
-       profiles in ${MAIN_DIR} and ${SECOND_DIR} are the setup now. To seed
-       again, restore the archive first (ROLLBACK.md, Level 3), or pass
-       --source pointing at a profile that still exists."
+       profiles $(profiles_english "${HOME}/.claude-" and) are the setup now.
+       To seed again, restore the archive first (ROLLBACK.md, Level 3), or
+       pass --source pointing at a profile that still exists."
     fi
     die "source profile '${SOURCE}' does not exist.
        If you have never run Claude Code, run it once and log in first."
@@ -388,13 +577,18 @@ preflight() {
     warn "'rollback' will stop at their prompt unless you pass --yes."
   fi
 
-  local d
-  for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+  local d name
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     if [ -e "$d" ]; then
       warn "'${d}' already exists. apply is additive and will not delete it,"
       warn "but check 'verify' output afterwards."
     fi
   done
+  if [ -e "$SHARED" ]; then
+    warn "'${SHARED}' already exists. apply is additive and will not delete it,"
+    warn "but check 'verify' output afterwards."
+  fi
 
   # Data already sitting in a profile directory. This is the case where the
   # user tried CLAUDE_CONFIG_DIR by hand before finding this script, so
@@ -402,27 +596,21 @@ preflight() {
   # exist nowhere else. make_profile() cannot link over that, so without
   # --adopt this is a hard stop for apply (and a warning for plan) rather
   # than a half-linked profile discovered afterwards.
-  ADOPT_PATHS_MAIN=$(profile_real_share_paths "$MAIN_DIR")
-  ADOPT_PATHS_SECOND=$(profile_real_share_paths "$SECOND_DIR")
-  if [ -n "$ADOPT_PATHS_MAIN" ] || [ -n "$ADOPT_PATHS_SECOND" ]; then
-    say ""
-    if [ -n "$ADOPT_PATHS_MAIN" ]; then
-      warn "'${MAIN_DIR}' already holds real data (not symlinks) at:"
-      warn "  $(printf '%s' "$ADOPT_PATHS_MAIN" | tr '\n' ' ')"
-    fi
-    if [ -n "$ADOPT_PATHS_SECOND" ]; then
-      warn "'${SECOND_DIR}' already holds real data (not symlinks) at:"
-      warn "  $(printf '%s' "$ADOPT_PATHS_SECOND" | tr '\n' ' ')"
-    fi
+  local plist any_real=0
+  for name in $PROFILES; do
+    plist=$(adopt_paths_for "$name")
+    [ -n "$plist" ] || continue
+    if [ "$any_real" -eq 0 ]; then say ""; any_real=1; fi
+    warn "'$(profile_dir "$name")' already holds real data (not symlinks) at:"
+    warn "  $(printf '%s' "$plist" | tr '\n' ' ')"
     if [ "$ADOPT" -eq 1 ]; then
       # Recorded in the conf file by write_conf(), which runs before the
       # merge itself, so the names are worked out here.
-      if [ -n "$ADOPT_PATHS_MAIN" ]; then
-        ADOPTED_NAMES="${ADOPTED_NAMES}${ADOPTED_NAMES:+ }${MAIN}"
-      fi
-      if [ -n "$ADOPT_PATHS_SECOND" ]; then
-        ADOPTED_NAMES="${ADOPTED_NAMES}${ADOPTED_NAMES:+ }${SECOND}"
-      fi
+      ADOPTED_NAMES="${ADOPTED_NAMES}${ADOPTED_NAMES:+ }${name}"
+    fi
+  done
+  if [ "$any_real" -eq 1 ]; then
+    if [ "$ADOPT" -eq 1 ]; then
       info "--adopt given: each directory above is archived to ${BACKUP_ROOT}"
       info "first, then those paths are merged into ${SHARED} without ever"
       info "overwriting a file that is already there, and moved aside into"
@@ -444,7 +632,7 @@ preflight() {
 
   if [ "$OS" = "macos" ]; then
     info "macOS: credentials live in the Keychain, keyed to the config dir."
-    info "The '${MAIN}' profile will prompt for a browser login on first"
+    info "The '$(first_profile)' profile will prompt for a browser login on first"
     info "launch. That is fine. Log in with the SAME account. Never /logout."
   fi
 
@@ -462,12 +650,11 @@ preflight() {
   # --adopt archives each pre-existing profile directory as well, and copies
   # whatever the shared dir is missing out of it. Budget for both at full size.
   if [ "$ADOPT" -eq 1 ]; then
-    if [ -n "$ADOPT_PATHS_MAIN" ]; then
-      total=$((total + 2 * $(dir_kb "$MAIN_DIR")))
-    fi
-    if [ -n "$ADOPT_PATHS_SECOND" ]; then
-      total=$((total + 2 * $(dir_kb "$SECOND_DIR")))
-    fi
+    for name in $PROFILES; do
+      if [ -n "$(adopt_paths_for "$name")" ]; then
+        total=$((total + 2 * $(dir_kb "$(profile_dir "$name")")))
+      fi
+    done
   fi
   have=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
   info "source profile size: $(kb_h "$src_kb")"
@@ -611,13 +798,14 @@ adopted_value() {
 
 write_conf() {
   if [ "$DRY" -eq 1 ]; then
-    info "would record MAIN/SECOND/SHARE_MODE/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
+    info "would record PROFILES/SHARE_MODE/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
     return 0
   fi
+  # PROFILES= replaces the MAIN=/SECOND= pair older versions wrote; the
+  # loader still understands those, and this rewrite drops them.
   {
     printf 'VERSION=%s\n'    "$VERSION"
-    printf 'MAIN=%s\n'       "$MAIN"
-    printf 'SECOND=%s\n'     "$SECOND"
+    printf 'PROFILES=%s\n'   "$(profiles_csv)"
     printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
     printf 'SOURCE=%s\n'     "$SOURCE"
     printf 'CLAUDE_VERSION=%s\n' "$(claude_version)"
@@ -755,18 +943,14 @@ profile_real_share_paths() {
   return 0
 }
 
-adopt_list_for() {
-  # The adopt list belonging to a profile directory, for make_profile().
-  if [ "$1" = "$MAIN_DIR" ]; then printf '%s' "$ADOPT_PATHS_MAIN"
-  else printf '%s' "$ADOPT_PATHS_SECOND"; fi
-}
-
-in_list() {
-  local needle="$1" hay="$2" x
-  for x in $hay; do
-    if [ "$x" = "$needle" ]; then return 0; fi
-  done
-  return 1
+adopt_paths_for() {
+  # The adopt list belonging to a profile NAME. Computed on demand rather
+  # than stored per name, because bash 3.2 has no associative arrays and the
+  # answer is only ever a handful of [ -e ] tests. Callers read it before
+  # do_adopt has moved anything, so recomputing gives the same answer the
+  # preflight printed; afterwards the paths are gone and it is empty, which
+  # is what make_profile wants to see.
+  profile_real_share_paths "$(profile_dir "$1")"
 }
 
 merge_tree() {
@@ -980,7 +1164,7 @@ make_profile() {
       # In plan mode with --adopt the data is still there, because do_adopt
       # only printed what it would move. Say what apply would do instead of
       # the refusal, which would be wrong.
-      if [ "$DRY" -eq 1 ] && [ "$ADOPT" -eq 1 ] && in_list "$p" "$(adopt_list_for "$dir")"; then
+      if [ "$DRY" -eq 1 ] && [ "$ADOPT" -eq 1 ] && in_list "$p" "$(adopt_paths_for "$label")"; then
         info "link   ${p} -> ${SHARED}/${p} (once adopt has moved the existing data aside)"
       else
         warn "'${dir}/${p}' exists and is NOT a symlink."
@@ -1000,33 +1184,35 @@ write_snippet() {
   hdr "Launcher functions"
   info "file: ${SNIPPET_FILE}"
 
-  local body
+  # One function per profile, built up first: a heredoc cannot loop.
+  local body funcs="" n
+  for n in $PROFILES; do
+    funcs="${funcs}claude-${n}() {
+  CLAUDE_CONFIG_DIR=\"$(profile_dir "$n")\" command claude \"\$@\"
+}
+
+"
+  done
+
   body=$(cat <<EOF
 # ---8<--- claude-profiles v${VERSION} ---8<---
 # Generated by claude-profiles.sh. Safe to edit. Sourced by bash and zsh.
 # Each launcher points Claude Code at its own config directory, which holds
 # that profile's credentials and app state.
+# Launchers defined here: $(profiles_english claude- and)
 
-claude-${MAIN}() {
-  CLAUDE_CONFIG_DIR="${MAIN_DIR}" command claude "\$@"
-}
-
-claude-${SECOND}() {
-  CLAUDE_CONFIG_DIR="${SECOND_DIR}" command claude "\$@"
-}
-
-# Guard rail: bare 'claude' would silently use ~/.claude, the untouched
+${funcs}# Guard rail: bare 'claude' would silently use ~/.claude, the untouched
 # pre-migration profile. Force an explicit choice, EXCEPT when a profile has
 # already been chosen via CLAUDE_CONFIG_DIR. That exception is what lets
 # 'claude --version', 'claude mcp ...' and similar work inside a session
-# started with claude-${MAIN} or claude-${SECOND}, since the session's shell
+# started with $(profiles_english claude-), since the session's shell
 # inherits the variable.
 claude() {
   if [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
     command claude "\$@"
     return
   fi
-  printf '%s\n' "Pick a profile: claude-${MAIN} or claude-${SECOND}" >&2
+  printf '%s\n' "Pick a profile: $(profiles_english claude-)" >&2
   printf '%s\n' "(bare 'claude' would use ~/.claude, the old profile." >&2
   printf '%s\n' " Set CLAUDE_CONFIG_DIR yourself to override this guard.)" >&2
   return 1
@@ -1159,6 +1345,33 @@ profile_auth() {
     "$(printf '%s' "$out" | json_str subscriptionType)"
 }
 
+points_into_new_setup() {
+  # True if $1 is a path inside the shared directory or any profile
+  # directory. Used to catch a symlink in SOURCE that points at the new
+  # setup, which this script never creates.
+  local t="$1" n
+  case "$t" in "${SHARED}"/*) return 0 ;; esac
+  for n in $PROFILES; do
+    case "$t" in "$(profile_dir "$n")"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+name_for_email() {
+  # $1 = an email, $2 = a flat "email name email name ..." list. Prints the
+  # name recorded for that email, or nothing.
+  local want="$1" tok cur="" want_name=0
+  for tok in $2; do
+    if [ "$want_name" -eq 0 ]; then
+      cur="$tok"; want_name=1
+    else
+      if [ "$cur" = "$want" ]; then printf '%s' "$tok"; return 0; fi
+      want_name=0
+    fi
+  done
+  return 0
+}
+
 refs_old_profile() {
   # Does a settings file point at absolute paths under ~/.claude ?
   [ -f "$1" ] || return 1
@@ -1194,8 +1407,11 @@ do_verify() {
   cur=$(claude_version)
 
   hdr "Directories"
-  local d
-  for d in "$SOURCE" "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+  local d name dirs=""
+  for name in $PROFILES; do
+    dirs="${dirs} $(profile_dir "$name")"
+  done
+  for d in "$SOURCE" $dirs "$SHARED"; do
     if [ -d "$d" ]; then
       ok "$d"
     elif [ "$d" = "$SOURCE" ] && [ -n "$CONF_FINALIZED" ]; then
@@ -1206,9 +1422,9 @@ do_verify() {
     fi
   done
   if [ "$CONF_LOADED" -eq 1 ]; then
-    ok "settings read from ${CONF_FILE} (main=${MAIN} second=${SECOND} share=${SHARE_MODE})"
+    ok "settings read from ${CONF_FILE} (profiles=$(profiles_csv) share=${SHARE_MODE})"
   else
-    info "no ${CONF_FILE}; checking against defaults/flags (main=${MAIN} second=${SECOND} share=${SHARE_MODE})"
+    info "no ${CONF_FILE}; checking against defaults/flags (profiles=$(profiles_csv) share=${SHARE_MODE})"
   fi
 
   hdr "Source profile untouched"
@@ -1218,12 +1434,9 @@ do_verify() {
     info "There is no source profile left to leave untouched."
   else
     for p in $SHARE_ALL $PRIVATE; do
-      if [ -L "${SOURCE}/${p}" ]; then
-        case "$(readlink "${SOURCE}/${p}")" in
-          "${SHARED}"/*|"${MAIN_DIR}"/*|"${SECOND_DIR}"/*)
-            warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
-            touched=1 ;;
-        esac
+      if [ -L "${SOURCE}/${p}" ] && points_into_new_setup "$(readlink "${SOURCE}/${p}")"; then
+        warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
+        touched=1
       fi
     done
     if [ "$touched" -eq 0 ]; then ok "nothing in ${SOURCE} points at the new directories"
@@ -1232,7 +1445,8 @@ do_verify() {
 
   hdr "Shared links"
   local dir
-  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
     [ -d "$dir" ] || continue
     local bad=0
     for p in $SHARE_ALL; do
@@ -1254,7 +1468,8 @@ do_verify() {
     info "conf records --adopt was used for: ${CONF_ADOPTED}"
     any_adopted=1
   fi
-  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
     [ -d "$dir" ] || continue
     for ad in "${dir}"/.adopted-*; do
       if [ -d "$ad" ]; then
@@ -1271,12 +1486,13 @@ do_verify() {
   fi
 
   hdr "Credential isolation"
-  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
     [ -d "$dir" ] || continue
     for p in $PRIVATE; do
       if [ -L "${dir}/${p}" ]; then
         warn "$(basename "$dir")/${p} is a SYMLINK. It must be a real, per-profile"
-        warn "file or directory or the two profiles are not isolated."
+        warn "file or directory or the profiles are not isolated."
         problems=$((problems+1))
       fi
     done
@@ -1298,12 +1514,14 @@ do_verify() {
   if ! command -v claude >/dev/null 2>&1; then
     info "'claude' is not on PATH; skipping account checks (cannot ask which account each profile holds)."
   else
-    local m_logged="" m_email=""
-    local s_logged="" s_email=""
-    local name line logged email org sub
-    for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+    # "email name email name ..." for every profile seen logged in so far.
+    # Each new profile is compared against that, so ANY pair sharing an
+    # account is reported, not just the first two. No arrays: emails cannot
+    # contain a space, so a flat list splits unambiguously.
+    local seen="" clash line logged email org sub
+    for name in $PROFILES; do
+      dir=$(profile_dir "$name")
       [ -d "$dir" ] || continue
-      if [ "$dir" = "$MAIN_DIR" ]; then name="$MAIN"; else name="$SECOND"; fi
       if ! profile_launched "$dir"; then
         info "${name}: not launched yet, skipping (checking would create its .claude.json)"
         continue
@@ -1313,37 +1531,39 @@ do_verify() {
       email=$(printf '%s' "$line" | cut -f2)
       org=$(printf '%s' "$line" | cut -f3)
       sub=$(printf '%s' "$line" | cut -f4)
-      if [ "$logged" = "true" ]; then
-        ok "${name}: ${email} (${org}, ${sub})"
-      else
+      if [ "$logged" != "true" ]; then
         warn "${name}: not logged in"
+        continue
       fi
-      if [ "$dir" = "$MAIN_DIR" ]; then
-        m_logged="$logged"; m_email="$email"
+      ok "${name}: ${email} (${org}, ${sub})"
+      # An absent email reads as "unset" for every profile alike, which is
+      # not evidence of a shared account.
+      [ "$email" = "unset" ] && continue
+      clash=$(name_for_email "$email" "$seen")
+      if [ -n "$clash" ]; then
+        warn "${clash} and ${name} are both logged in as the same account (${email})."
+        warn "That defeats the purpose of separate profiles."
+        problems=$((problems+1))
       else
-        s_logged="$logged"; s_email="$email"
+        seen="${seen}${seen:+ }${email} ${name}"
       fi
     done
-    if [ "$m_logged" = "true" ] && [ "$s_logged" = "true" ] && [ "$m_email" = "$s_email" ]; then
-      warn "${MAIN} and ${SECOND} are both logged in as the same account (${m_email})."
-      warn "That defeats the purpose of two separate profiles."
-      problems=$((problems+1))
-    fi
   fi
 
   hdr "Per-profile app state (.claude.json)"
   info "With CLAUDE_CONFIG_DIR set, Claude Code keeps this inside the profile"
   info "dir. If a launched profile has none there, that version fell back to"
   # shellcheck disable=SC2088
-  info "~/.claude.json, which both profiles would share: NOT isolated."
-  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+  info "~/.claude.json, which every profile would share: NOT isolated."
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
     [ -d "$dir" ] || continue
     if [ -f "${dir}/.claude.json" ]; then
       ok "$(basename "$dir")/.claude.json present (good: state is per-profile)"
     elif profile_launched "$dir"; then
       warn "$(basename "$dir") has been launched but has no .claude.json."
       warn "Your Claude Code version keeps that state at ~/.claude.json instead,"
-      warn "which both profiles share. The accounts are NOT isolated."
+      warn "which every profile shares. The accounts are NOT isolated."
       warn "Stop here and read README.md, section 'If verify flags .claude.json'."
       problems=$((problems+1))
     else
@@ -1354,22 +1574,34 @@ do_verify() {
   [ -f "${HOME}/.claude.json" ] && info "~/.claude.json also exists (old profile's state, expected)"
 
   hdr "Retention settings"
-  local a b
-  a=$(json_num "${MAIN_DIR}/settings.json" cleanupPeriodDays)
-  b=$(json_num "${SECOND_DIR}/settings.json" cleanupPeriodDays)
-  info "${MAIN}: cleanupPeriodDays=${a}   ${SECOND}: cleanupPeriodDays=${b}"
-  if [ "$a" != "$b" ]; then
-    warn "These differ. Both profiles sweep the SAME shared directories,"
-    warn "so the shorter period wins and will delete the other's data."
-    warn "Set them to the same value in both settings.json files."
+  # Every profile sweeps the same shared directories, so all of them have to
+  # agree, not just the first two. The first profile's value is the reference
+  # only because something has to be; the warning names the odd ones out.
+  local v ref="" reported="" odd=""
+  for name in $PROFILES; do
+    v=$(json_num "$(profile_dir "$name")/settings.json" cleanupPeriodDays)
+    reported="${reported}${reported:+   }${name}: cleanupPeriodDays=${v}"
+    if [ -z "$ref" ]; then
+      ref="$v"
+    elif [ "$v" != "$ref" ]; then
+      odd="${odd}${odd:+ }${name}"
+    fi
+  done
+  info "$reported"
+  if [ -n "$odd" ]; then
+    warn "These differ: ${odd} (measured against $(first_profile)'s ${ref})."
+    warn "Every profile sweeps the SAME shared directories, so the shortest"
+    warn "period wins and will delete the others' data."
+    warn "Set them to the same value in every settings.json."
     problems=$((problems+1))
   else
-    ok "matching (or both unset, which is the 30-day default)"
+    ok "matching (or all unset, which is the 30-day default)"
   fi
 
   hdr "Settings that still point at ${SOURCE}"
   local refs=0 extra
-  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
     if refs_old_profile "${dir}/settings.json"; then
       warn "$(basename "$dir")/settings.json references paths under ~/.claude/"
       warn "(statusLine command, hooks, or similar). apply relocates scripts"
@@ -1395,9 +1627,13 @@ do_verify() {
   rc=$(rc_file)
   if [ -f "$SNIPPET_FILE" ]; then
     ok "$SNIPPET_FILE"
-    if ! grep -q "^claude-${MAIN}()" "$SNIPPET_FILE" \
-       || ! grep -q "^claude-${SECOND}()" "$SNIPPET_FILE"; then
-      warn "snippet does not define claude-${MAIN} and claude-${SECOND};"
+    local missing=""
+    for name in $PROFILES; do
+      grep -q "^claude-${name}()" "$SNIPPET_FILE" \
+        || missing="${missing}${missing:+ }claude-${name}"
+    done
+    if [ -n "$missing" ]; then
+      warn "snippet does not define ${missing};"
       warn "it was written for different names. Re-run apply to regenerate."
       problems=$((problems+1))
     fi
@@ -1446,9 +1682,11 @@ do_verify() {
 
 do_rollback() {
   hdr "Rollback"
+  local name
   say "This removes ONLY what this script created:"
-  say "  ${MAIN_DIR}"
-  say "  ${SECOND_DIR}"
+  for name in $PROFILES; do
+    say "  $(profile_dir "$name")"
+  done
   say "  ${SHARED}"
   say "  ${SNIPPET_FILE}"
   say "  the source line it added to your shell rc file (backed up first)"
@@ -1460,7 +1698,8 @@ do_rollback() {
   warn "${SHARED} and will be lost. Copy them out first if you want them."
 
   local d
-  for d in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     if [ -d "${d}/sessions" ] && [ -n "$(ls -A "${d}/sessions" 2>/dev/null)" ]; then
       warn "${d}/sessions is not empty: a Claude Code session may still be"
       warn "running in that profile. Quit it before continuing."
@@ -1471,12 +1710,20 @@ do_rollback() {
     info "are not removed. Delete them in Keychain Access if you want."
   fi
 
-  confirm "Remove the five items above?" || { say "aborted"; return 0; }
+  confirm "Remove everything listed above?" || { say "aborted"; return 0; }
 
-  for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+  # The guard runs per directory, immediately before its own rm, so a source
+  # that resolves to any one of them stops the whole command.
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     same_path "$d" "$SOURCE" && die "refusing: '${d}' is the source profile"
+  done
+  same_path "$SHARED" "$SOURCE" && die "refusing: '${SHARED}' is the source profile"
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     [ -d "$d" ] && { info "removing ${d}"; rm -rf "$d"; }
   done
+  [ -d "$SHARED" ] && { info "removing ${SHARED}"; rm -rf "$SHARED"; }
   [ -f "$SNIPPET_FILE" ] && { info "removing ${SNIPPET_FILE}"; rm -f "$SNIPPET_FILE"; }
 
   hdr "Shell rc file"
@@ -1574,7 +1821,7 @@ do_finalize() {
   # fixed order, and the confirmation is deliberately LAST: a run without
   # --yes prints every gate it passed and then stops, so it doubles as the
   # dry run that `plan` does not provide for this command.
-  local conf_src d vst stamp archive src_is_home entries
+  local conf_src d vst stamp archive src_is_home entries name first
 
   hdr "Finalize"
   say "This is the only command in this script that deletes ${SOURCE}."
@@ -1614,14 +1861,20 @@ do_finalize() {
 
   # -- gate 2: not one of the directories this script created ---------------
   hdr "Gate 2: not one of the new directories"
-  for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     if same_path "$SOURCE" "$d"; then
       die "refusing: '${SOURCE}' resolves to '${d}', which this script created.
        finalize removes the OLD profile, never the new ones. If you want the
        new ones gone, that is 'rollback'."
     fi
   done
-  ok "gate 2: '${SOURCE}' is none of ${MAIN_DIR}, ${SECOND_DIR}, ${SHARED}"
+  if same_path "$SOURCE" "$SHARED"; then
+    die "refusing: '${SOURCE}' resolves to '${SHARED}', which this script created.
+       finalize removes the OLD profile, never the new ones. If you want the
+       new ones gone, that is 'rollback'."
+  fi
+  ok "gate 2: '${SOURCE}' is none of $(profiles_english "${HOME}/.claude-" and), ${SHARED}"
 
   # -- gate 3: the new setup is actually healthy ----------------------------
   hdr "Gate 3: full verify"
@@ -1638,7 +1891,8 @@ do_finalize() {
 
   # -- gate 4: nothing still points into the source -------------------------
   hdr "Gate 4: no settings pointing into ${SOURCE}"
-  for d in "$MAIN_DIR" "$SECOND_DIR"; do
+  for name in $PROFILES; do
+    d=$(profile_dir "$name")
     if refs_old_profile "${d}/settings.json"; then
       warn "still pointing there: $(find_old_claude_paths "${d}/settings.json" | tr '\n' ' ')"
       die "${d}/settings.json still references paths under ~/.claude/.
@@ -1647,7 +1901,7 @@ do_finalize() {
        the setting), or fix the path by hand, then run finalize again."
     fi
   done
-  ok "gate 4: neither profile's settings.json references a path under ${SOURCE}"
+  ok "gate 4: no profile's settings.json references a path under ${SOURCE}"
 
   # -- gate 5: no live session on the old profile ---------------------------
   hdr "Gate 5: no session running on ${SOURCE}"
@@ -1667,7 +1921,7 @@ do_finalize() {
       warn ""
       warn "CLAUDE_CONFIG_DIR is '${CLAUDE_CONFIG_DIR:-unset}', so the terminal"
       warn "running this may itself be a Claude Code session on the old"
-      warn "profile. Run finalize from a claude-${MAIN} or claude-${SECOND}"
+      warn "profile. Run finalize from a $(profiles_english claude-)"
       warn "session, or from a plain terminal after quitting that session."
     fi
     die "refusing: ${SOURCE}/sessions has entries. Quit the session, check
@@ -1676,25 +1930,32 @@ do_finalize() {
   ok "gate 5: ${SOURCE}/sessions is empty or absent (no live session there)"
 
   # -- gate 6: the profiles hold their own credentials ----------------------
-  hdr "Gate 6: the profiles' own credentials"
-  if [ -f "${MAIN_DIR}/.credentials.json" ]; then
-    ok "gate 6: ${MAIN_DIR}/.credentials.json is a real file of its own"
+  # Only the FIRST profile inherited the login and app state that deleting
+  # SOURCE would otherwise take with it; the others were always meant to
+  # start empty, so a missing credentials file there is not this gate's
+  # business.
+  first=$(first_profile)
+  local first_dir
+  first_dir=$(profile_dir "$first")
+  hdr "Gate 6: the inheriting profile's own credentials"
+  if [ -f "${first_dir}/.credentials.json" ]; then
+    ok "gate 6: ${first_dir}/.credentials.json is a real file of its own"
   elif [ "$OS" = "macos" ]; then
-    ok "gate 6: no ${MAIN_DIR}/.credentials.json, which is expected on macOS"
+    ok "gate 6: no ${first_dir}/.credentials.json, which is expected on macOS"
     info "(the Keychain entry is keyed to the config directory, so the profile"
     info " has its own login there rather than in a file)"
   else
-    die "${MAIN_DIR} has no .credentials.json of its own. On Linux that means
-       the '${MAIN}' profile is not carrying the login you meant to keep, and
-       '${SOURCE}' may be the only place it exists. Launch claude-${MAIN} and
+    die "${first_dir} has no .credentials.json of its own. On Linux that means
+       the '${first}' profile is not carrying the login you meant to keep, and
+       '${SOURCE}' may be the only place it exists. Launch claude-${first} and
        log in (never /logout), or re-run 'apply', before finalize."
   fi
-  if [ ! -f "${MAIN_DIR}/.claude.json" ]; then
-    die "${MAIN_DIR}/.claude.json is missing: the '${MAIN}' profile has no app
+  if [ ! -f "${first_dir}/.claude.json" ]; then
+    die "${first_dir}/.claude.json is missing: the '${first}' profile has no app
        state of its own (onboarding, project trust, user-scope MCP servers).
-       Launch claude-${MAIN} once, or re-run 'apply', before finalize."
+       Launch claude-${first} once, or re-run 'apply', before finalize."
   fi
-  ok "gate 6: ${MAIN_DIR}/.claude.json is present"
+  ok "gate 6: ${first_dir}/.claude.json is present"
   info "both are copies, so deleting ${SOURCE} cannot affect them. Checked"
   info "anyway: a missing one means the login is not in the new profile yet."
 
@@ -1733,15 +1994,16 @@ do_finalize() {
   say "  DELETE, permanently:"
   say "    ${SOURCE}   ($(du -sh "$SOURCE" 2>/dev/null | cut -f1) on disk)"
   if [ "$src_is_home" -eq 1 ] && [ -f "${HOME}/.claude.json" ]; then
-    say "    ${HOME}/.claude.json   (its copy lives in ${MAIN_DIR}/.claude.json)"
+    say "    ${HOME}/.claude.json   (its copy lives in ${first_dir}/.claude.json)"
   fi
   say ""
   say "  held in this archive, and nowhere else afterwards:"
   say "    ${archive}"
   say ""
   say "  stays, and is your setup from now on:"
-  say "    ${MAIN_DIR}     (claude-${MAIN})"
-  say "    ${SECOND_DIR}   (claude-${SECOND})"
+  for name in $PROFILES; do
+    say "    $(profile_dir "$name")     (claude-${name})"
+  done
   say "    ${SHARED}"
   say "    ${BACKUP_ROOT}"
   say ""
@@ -1766,8 +2028,8 @@ do_finalize() {
   ok "recorded FINALIZED=${stamp} in ${CONF_FILE}"
 
   hdr "Done"
-  say "  ${SOURCE} is gone. ${MAIN_DIR} and ${SECOND_DIR} are the setup now;"
-  say "  launch them with claude-${MAIN} and claude-${SECOND} as before."
+  say "  ${SOURCE} is gone. $(profiles_english "${HOME}/.claude-" and) are the"
+  say "  setup now; launch them with $(profiles_english claude- and) as before."
   say "  'verify' keeps working and now reports the source as removed."
   say ""
   say "  The only way back is the archive:"
@@ -1781,15 +2043,34 @@ do_finalize() {
 banner() {
   say ""
   say "claude-profiles v${VERSION}   os=${OS}  share=${SHARE_MODE}"
-  [ "$CONF_LOADED" -eq 1 ] && say "  (names/mode/source remembered from ${CONF_FILE}; flags override)"
+  [ "$CONF_LOADED" -eq 1 ] && say "  (profiles/mode/source remembered from ${CONF_FILE}; flags override)"
   if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
     say "  source (removed by finalize on ${CONF_FINALIZED}) : ${SOURCE}"
   else
     say "  source (never modified) : ${SOURCE}"
   fi
-  say "  main profile            : ${MAIN_DIR}   (inherits current login)"
-  say "  second profile          : ${SECOND_DIR}   (fresh login)"
+  local n line="" i=0
+  for n in $PROFILES; do
+    i=$((i+1))
+    if [ "$i" -eq 1 ]; then line="${n} (inherits current login)"
+    else line="${line}, ${n}"; fi
+  done
+  say "  profiles                : ${line}"
+  say "  profile dirs            : ${HOME}/.claude-<name>, one per name above"
   say "  shared data             : ${SHARED}"
+}
+
+build_profiles() {
+  # Adopt-then-link, profile by profile, in the order the list gives. The
+  # first name is the one that inherits the current login; every other one
+  # starts empty.
+  local name dir inherit=yes
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    do_adopt "$dir" "$name" "$(adopt_paths_for "$name")"
+    make_profile "$dir" "$name" "$inherit"
+    inherit=no
+  done
 }
 
 case "$CMD" in
@@ -1800,10 +2081,7 @@ case "$CMD" in
     do_backup
     seed_shared
     write_conf
-    do_adopt "$MAIN_DIR"   "$MAIN"   "$ADOPT_PATHS_MAIN"
-    make_profile "$MAIN_DIR"   "$MAIN"   yes
-    do_adopt "$SECOND_DIR" "$SECOND" "$ADOPT_PATHS_SECOND"
-    make_profile "$SECOND_DIR" "$SECOND" no
+    build_profiles
     write_snippet
     hdr "Plan complete"
     info "Nothing was changed. Re-run with 'apply' to execute."
@@ -1813,28 +2091,32 @@ case "$CMD" in
     banner
     preflight
     say ""
-    say "About to create the three directories above. ${SOURCE} is only read."
+    say "About to create the directories above. ${SOURCE} is only read."
     confirm "Proceed?" || { say "aborted"; exit 1; }
     do_backup
     seed_shared
     write_conf
-    do_adopt "$MAIN_DIR"   "$MAIN"   "$ADOPT_PATHS_MAIN"
-    make_profile "$MAIN_DIR"   "$MAIN"   yes
-    do_adopt "$SECOND_DIR" "$SECOND" "$ADOPT_PATHS_SECOND"
-    make_profile "$SECOND_DIR" "$SECOND" no
+    build_profiles
     write_snippet
     hdr "Next steps"
+    FIRST_NAME=$(first_profile)
     say "  1. Open a NEW terminal (so the launcher functions load)."
-    say "  2. Run:  claude-${MAIN}"
+    say "  2. Run:  claude-${FIRST_NAME}"
     say "     It should already be logged in as your current account."
     say "     If it asks you to log in, log in with the SAME account."
     say "     Do NOT run /logout, in any profile, at any point."
-    say "  3. Quit, then run:  claude-${SECOND}"
-    say "     Log in with the OTHER account when the browser opens."
+    say "  3. Quit, then run each of the others and log in with its own"
+    say "     account when the browser opens:"
+    SECOND_NAME=""
+    for n in $PROFILES; do
+      [ "$n" = "$FIRST_NAME" ] && continue
+      [ -n "$SECOND_NAME" ] || SECOND_NAME="$n"
+      say "       claude-${n}"
+    done
     say "  4. Run:  ./claude-profiles.sh verify"
     say "     Pay attention to the .claude.json section."
     say "  5. Confirm sharing works: start a session in one profile, then"
-    say "     run  claude-${SECOND} --resume  in the same project directory."
+    say "     run  claude-${SECOND_NAME} --resume  in the same project directory."
     say ""
     say "  ${SOURCE} is untouched and still works, and the shared data is a"
     say "  copy, so it is on disk twice until you remove it. When you are"

@@ -1,10 +1,12 @@
 # claude-profiles
 
-Two Claude Code accounts on one machine, sharing sessions.
+Two or more Claude Code accounts on one machine, sharing sessions.
 
 Run a work account and a personal account side by side on the same machine,
 both logged in at once, sharing session transcripts, prompt history,
-checkpoints, skills and plugins.
+checkpoints, skills and plugins. The same script scales past two: if you work
+for several clients under a separate Claude account each, set up one named
+profile per client and all of them share that history together.
 
 Contents of this bundle:
 
@@ -44,11 +46,32 @@ claude-personal                      # browser login, second account
 ./claude-profiles.sh finalize        # the only supported way to delete ~/.claude
 ```
 
+### Several clients
+
+More than two accounts works the same way. Name every profile explicitly;
+the first name keeps your current login, every other one gets its own
+browser login:
+
+```bash
+./claude-profiles.sh plan    --profiles personal,acme,globex
+./claude-profiles.sh apply   --profiles personal,acme,globex --shell --share full
+```
+
+Launchers: `claude-personal` (already logged in), `claude-acme` and
+`claude-globex` (each a fresh browser login).
+
+Running `plan` or `apply` with no `--profiles` flag from a real terminal, no
+conf file yet and no `--yes`, asks interactively instead of silently
+defaulting: "Easy setup with claude-work and claude-personal? [Y/n]", and on
+`n` asks how many profiles and a name for each. Pass `--profiles` (or
+`--yes`) to skip the prompt, which is what any non-interactive run must do.
+
 Useful options:
 
 ```
---main NAME      name of the profile that inherits your current login (default: work)
---second NAME    name of the second profile (default: personal)
+--profiles LIST  comma-separated profile names, at least two (default:
+                 work,personal); the first inherits your current login,
+                 every other one starts empty and logs in via the browser
 --share full     share transcripts too (default)
 --share safe     do NOT share transcripts, see below
 --source DIR     seed from a profile other than ~/.claude
@@ -58,10 +81,14 @@ Useful options:
 --yes            skip confirmations; required when no terminal can answer them
 ```
 
-`--main`, `--second`, `--share` and `--source` are remembered in
-`~/.claude-shared/.claude-profiles.conf` after `apply`, so `verify` and
-`rollback` use the same values without you repeating them. Explicit flags
-always win.
+`--main NAME` and `--second NAME` still work, as deprecated aliases for
+`--profiles NAME,NAME`; using either prints a deprecation notice, and
+combining them with `--profiles` is an error.
+
+`--profiles` (recorded as `PROFILES=name,name,...`), `--share` and `--source`
+are remembered in `~/.claude-shared/.claude-profiles.conf` after `apply`, so
+`verify` and `rollback` use the same values without you repeating them.
+Explicit flags always win.
 
 ---
 
@@ -69,12 +96,12 @@ always win.
 
 Claude Code reads its credentials, settings and session data from one
 directory, `~/.claude` by default. The `CLAUDE_CONFIG_DIR` environment
-variable points it somewhere else. Two directories means two independent
-logins that can run at the same time in different terminals.
+variable points it somewhere else. Several directories means several
+independent logins that can run at the same time in different terminals.
 
-By itself that also splits your session history in two, which is not what we
-want. So the data directories inside each profile are symlinked at a single
-shared location.
+By itself that also splits your session history across profiles, which is
+not what we want. So the data directories inside each profile are symlinked
+at a single shared location.
 
 ```
 ~/.claude              your existing setup. NEVER MODIFIED. Still works.
@@ -104,12 +131,18 @@ shared location.
                            verify and rollback do not need the flags again
 ```
 
-Launch with `claude-work` or `claude-personal`. Bare `claude` is deliberately
-shadowed with an error, so you cannot drift back onto the old profile by
-muscle memory. The shadow steps aside when `CLAUDE_CONFIG_DIR` is already
-set, which is what makes `claude --version`, `claude mcp add` and friends
-keep working *inside* a session started with `claude-work` (the session's
-shell inherits the variable).
+A third profile, and any further one, looks exactly like profile 2 above:
+its own fresh-login `.credentials.json`, its own `.claude.json`, and the same
+symlinks into `~/.claude-shared`.
+
+Launch with `claude-<name>` for each profile you set up: `claude-work` and
+`claude-personal` in the easy setup, one more launcher per further name.
+Bare `claude` is deliberately shadowed with an error that lists every
+launcher, so you cannot drift back onto the old profile by muscle memory.
+The shadow steps aside when `CLAUDE_CONFIG_DIR` is already set, which is what
+makes `claude --version`, `claude mcp add` and friends keep working *inside*
+a session started with `claude-work` (the session's shell inherits the
+variable).
 
 ---
 
@@ -128,11 +161,11 @@ account. The script is built around avoiding that:
    before the script continues; if tar fails outright, nothing else happens.
    The directory is mode 700 and the archive mode 600, because the archive
    contains your credentials.
-3. **You never run `/logout`.** The main profile gets a copy of the existing
-   credentials so it is already signed in. Only the second, empty profile
-   does a browser login. This matters: current Claude Code versions can
-   revoke the stored refresh token when you log out, which would kick you out
-   of the account you were trying to keep.
+3. **You never run `/logout`.** The profile that inherited your login gets a
+   copy of the existing credentials so it is already signed in. Every other,
+   fresh profile does its own browser login. This matters: current Claude
+   Code versions can revoke the stored refresh token when you log out, which
+   would kick you out of the account you were trying to keep.
 4. **`plan` is a real dry run.** It prints every command it would execute and
    changes nothing. Run it first, read it, then run `apply`.
 5. **`apply` refuses to clobber.** If a path where a symlink should go already
@@ -233,12 +266,12 @@ default.
 
 | Path | Effect of sharing |
 |---|---|
-| `projects/` | Transcripts and auto-memory. This is what makes `--resume` and `--continue` work across both accounts. |
-| `file-history/` | Checkpoint restore works across both. |
+| `projects/` | Transcripts and auto-memory. This is what makes `--resume` and `--continue` work across every account. |
+| `file-history/` | Checkpoint restore works across every profile. |
 | `history.jsonl` | Up-arrow prompt recall is one list. |
 | `plans/`, `tasks/`, `paste-cache/`, `image-cache/`, `uploads/`, `session-env/` | A resumed session has its task list, pasted text, images and attachments intact. |
-| `agent-memory/` | Subagents declared with `memory: user` keep one memory across both accounts. |
-| `skills/`, `commands/`, `agents/`, `workflows/`, `rules/`, `output-styles/`, `plugins/` | Configure once, works in both. |
+| `agent-memory/` | Subagents declared with `memory: user` keep one memory across every account. |
+| `skills/`, `commands/`, `agents/`, `workflows/`, `rules/`, `output-styles/`, `plugins/` | Configure once, works in every profile. |
 
 **`--share safe`** shares only `history.jsonl`, `plans/`, `paste-cache/` and
 the config directories. Transcripts and checkpoints stay per profile.
@@ -270,7 +303,7 @@ storage").
 | Path | Why not |
 |---|---|
 | `.credentials.json` | This is the entire point of the separation. If `verify` ever reports this as a symlink, the setup is broken. |
-| `.claude.json` | Holds the OAuth session, per-project trust decisions, and user-scope MCP servers. Sharing it would share the login. The main profile gets a *copy* of `~/.claude.json` so it inherits trust decisions and MCP servers; the second profile starts empty. |
+| `.claude.json` | Holds the OAuth session, per-project trust decisions, and user-scope MCP servers. Sharing it would share the login. The profile that inherited your login gets a *copy* of `~/.claude.json` so it inherits trust decisions and MCP servers; every other, fresh profile starts empty. |
 | `sessions/` | One file per running session, used for live-session detection and crash cleanup. Sharing it lets one profile clean up the other's running session. |
 | `backups/` | Rolling copies of that profile's own `.claude.json`. Meaningless if shared. |
 | `settings.json`, `CLAUDE.md` | Copied once into each profile, then free to diverge. Your work profile may have org-specific permissions or env you do not want in personal. |
@@ -279,27 +312,29 @@ storage").
 real files or directories in each profile, never symlinks, and that nothing
 inside `~/.claude` points at the new directories. It also asks the binary
 itself, via `claude auth status --json`, which account each launched
-profile is logged into, and refuses to pass if both profiles report the
+profile is logged into, and refuses to pass if any two profiles report the
 same account.
 
 ---
 
 ## Things that will surprise you
 
-**Trust prompts appear again in the second profile.** Per-project trust lives
-in `.claude.json`, which is per profile. The main profile inherits a copy of
-yours, so it behaves as before. The first time you open a given project in
-the second profile you get the trust dialog again, even though the
-transcripts are already sitting there. Answer it once per project.
+**Trust prompts appear again in every fresh profile.** Per-project trust
+lives in `.claude.json`, which is per profile. The profile that inherited
+your login inherits a copy of yours, so it behaves as before. The first time
+you open a given project in any other profile you get the trust dialog
+again, even though the transcripts are already sitting there. Answer it once
+per project, per profile.
 
-**User-scope MCP servers do not carry over to the second profile.** They also
+**User-scope MCP servers do not carry over to a fresh profile.** They also
 live in `.claude.json`. Add them again there with
-`claude-personal mcp add --scope user`, or move the ones you can into a
-project-level `.mcp.json` at the repo root, which both profiles read.
+`claude-personal mcp add --scope user` (or whichever launcher), or move the
+ones you can into a project-level `.mcp.json` at the repo root, which every
+profile reads.
 
 **Settings that point back at `~/.claude` by absolute path.** A `statusLine`
 command such as `~/.claude/statusline.sh`, or a hook script kept under
-`~/.claude/hooks/`, would otherwise be copied into both profiles'
+`~/.claude/hooks/`, would otherwise be copied into every profile's
 `settings.json` *still pointing at `~/.claude`*, which only works as long as
 `~/.claude` exists. `apply` fixes this itself: it copies any script that
 `settings.json` points at under `~/.claude/`, `$HOME/.claude/`, or your
@@ -325,26 +360,27 @@ today (see references), but a future version that rewrites `history.jsonl`
 through a temp file and rename would silently replace the link with a real
 file. `verify` catches exactly that, so run it after an upgrade.
 
-**`cleanupPeriodDays` must match in both profiles.** The retention sweep runs
-per profile but operates on the same shared `projects/` directory. If work is
-set to 7 days and personal is on the 30-day default, the work profile will
-silently delete your personal transcripts. `verify` checks this and complains
-if they differ. Same trap applies to `claude project purge`: run it in either
-profile and it wipes the shared copy.
+**`cleanupPeriodDays` must match across all profiles.** The retention sweep
+runs per profile but operates on the same shared `projects/` directory. If
+one profile is set to 7 days and another is on the 30-day default, the
+7-day profile will silently delete the other profiles' transcripts. `verify`
+checks this and complains if any profile differs. Same trap applies to
+`claude project purge`: run it in any profile and it wipes the shared copy.
 
-**Do not resume the same session from both profiles at once.** Different
-sessions in the same project directory are fine. The same `.jsonl` open in two
-processes means two writers appending to one file, and you will corrupt it.
-Nothing warns you.
+**Do not resume the same session from more than one profile at once.**
+Different sessions in the same project directory are fine. The same
+`.jsonl` open in two processes means two writers appending to one file, and
+you will corrupt it. Nothing warns you.
 
 **On macOS, credentials live in the Keychain, not in a file.** The Keychain
 entry is keyed to the config directory (the authentication docs: "keys the
 macOS Keychain entry to that directory too, so a session with a different
-`CLAUDE_CONFIG_DIR` reads a different entry"). So the main profile *will*
-prompt for a browser login on first launch, because there is no entry for
-`~/.claude-work` yet. That is fine. Log in with the *same* account. It is a
-login, not a logout, and revokes nothing. The exception is a Mac where the
-Keychain was locked at login time (typical over SSH): Claude Code then falls
+`CLAUDE_CONFIG_DIR` reads a different entry"). So the profile that inherited
+your login *will* prompt for a browser login on first launch, because there
+is no entry for `~/.claude-work` yet. That is fine. Log in with the *same*
+account. It is a login, not a logout, and revokes nothing. The exception is
+a Mac where the Keychain was locked at login time (typical over SSH): Claude
+Code then falls
 back to `.credentials.json` in the config dir, the script copies that file,
 and no prompt appears. `verify` prints how many `Claude Code` Keychain
 entries exist so you can see that each profile got its own.
@@ -364,7 +400,7 @@ This is the one command in the script whose purpose is to delete
 `~/.claude`, and the only supported way to do it. A hand-run
 `rm -rf ~/.claude` is a genuinely bad idea: it can delete the transcript of
 a session that is still running, remove a `statusLine` or hook script that
-both new profiles still point at, or run from a terminal that *is itself* a
+every new profile still points at, or run from a terminal that *is itself* a
 Claude Code session on the old profile.
 
 `finalize` checks all of that first. Eight gates, in this order, each one a
@@ -375,12 +411,12 @@ refusal with a specific message:
    deleted. Without `--source` that is `~/.claude`. If the source is already
    gone it says so and stops.
 2. **The target is not one of the new directories.** It refuses if the source
-   resolves to either profile or the shared directory. Removing those is
+   resolves to any profile or the shared directory. Removing those is
    `rollback`, not `finalize`.
 3. **A full `verify` passes.** The old profile is the fallback, so it only
    goes once the thing replacing it is provably healthy. Any problem `verify`
    reports stops finalize, and it prints that verify passed when it does.
-4. **No `settings.json` still points into the source.** If either profile has
+4. **No `settings.json` still points into the source.** If any profile has
    a `statusLine`, hook or command under `~/.claude/`, deleting the directory
    would break it. It names the file and tells you to re-run `apply` (which
    relocates such scripts into `~/.claude-shared`) or fix the path by hand.
@@ -390,10 +426,11 @@ refusal with a specific message:
    itself be a Claude Code session on the old profile, and that finalize has
    to be run from a `claude-<profile>` session or a plain terminal after
    quitting it.
-6. **The profiles hold their own credentials.** The main profile must have its
-   own `.credentials.json` (or be on macOS, where the Keychain holds it) and
-   its own `.claude.json`. These are copies and deleting the source cannot
-   touch them, but a missing one means the login you meant to keep never made
+6. **The profiles hold their own credentials.** The profile that inherited
+   your login must have its own `.credentials.json` (or be on macOS, where
+   the Keychain holds it) and its own `.claude.json`. These are copies and
+   deleting the source cannot touch them, but a missing one means the login
+   you meant to keep never made
    it into the new profile and the source is still the only place it exists.
 7. **A backup exists and reads back.** It takes a fresh `tar` archive of
    `~/.claude` and `~/.claude.json` and reads it back, exactly as `apply`
@@ -427,11 +464,11 @@ archive finalize took.
 ## If verify flags `.claude.json`
 
 `verify` checks that each profile has its own `.claude.json` *after* you have
-launched it once. The main profile gets a copy at setup, so the check that
-matters is on the second profile: if it has been launched and still has no
-`.claude.json` inside it, your Claude Code version is keeping that state at
-`~/.claude.json` instead, outside the config directory. Both profiles then
-share OAuth state and the isolation does not hold.
+launched it once. The profile that inherited your login gets a copy at
+setup, so the check that matters is on every fresh profile: if one has been
+launched and still has no `.claude.json` inside it, your Claude Code version
+is keeping that state at `~/.claude.json` instead, outside the config
+directory. Profiles then share OAuth state and the isolation does not hold.
 
 The docs for the `.claude` directory say that with `CLAUDE_CONFIG_DIR` set,
 "every `~/.claude` path on this page lives under that directory instead",
@@ -461,8 +498,8 @@ fixed the behaviour first.
 
 Not supported by this script, and the shell approach alone is not sufficient
 there. Claude Code keeps global state in `~/.claude.json` outside the config
-directory, so two simultaneous instances sharing one real home directory step
-on each other regardless of `CLAUDE_CONFIG_DIR`. You need separate
+directory, so multiple simultaneous instances sharing one real home directory
+step on each other regardless of `CLAUDE_CONFIG_DIR`. You need separate
 `USERPROFILE` values per instance. WSL works fine and this script runs there.
 
 ---
