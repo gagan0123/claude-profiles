@@ -53,6 +53,9 @@ DO_BACKUP=1
 ASSUME_YES=0
 ADOPT=0
 CMD=""
+JSON=0
+JSON_FILE=""
+VERIFY_PROBLEMS=0
 
 # One timestamp for the whole run, so an adopt archive and the .adopted-<stamp>
 # directory it came from carry the same name.
@@ -103,12 +106,21 @@ if [ -t 1 ]; then
   C_DIM=$'\033[2m';  C_OFF=$'\033[0m'
 fi
 
-say()  { printf '%s\n' "$*"; }
-info() { printf '%s\n' "  $*"; }
-ok()   { printf '%s\n' "  ${C_GRN}ok${C_OFF}   $*"; }
-warn() { printf '%s\n' "  ${C_YEL}warn${C_OFF} $*" >&2; }
+# Under --json, none of these print human text: say/hdr go silent, and
+# info/ok/warn instead append to the JSON_FILE recorder (see json_add_item,
+# defined just above do_verify) grouped under whatever hdr() named last. die()
+# is deliberately untouched by JSON: an error always goes to stderr as text,
+# JSON output or not.
+say()  { [ "$JSON" -eq 1 ] && return 0; printf '%s\n' "$*"; }
+info() { if [ "$JSON" -eq 1 ]; then json_add_item info "$*"; return 0; fi
+         printf '%s\n' "  $*"; }
+ok()   { if [ "$JSON" -eq 1 ]; then json_add_item ok "$*"; return 0; fi
+         printf '%s\n' "  ${C_GRN}ok${C_OFF}   $*"; }
+warn() { if [ "$JSON" -eq 1 ]; then json_add_item warn "$*"; return 0; fi
+         printf '%s\n' "  ${C_YEL}warn${C_OFF} $*" >&2; }
 die()  { printf '%s\n' "${C_RED}error${C_OFF} $*" >&2; exit 1; }
-hdr()  { printf '\n%s\n' "$*"; printf '%s\n' "$(printf '%*s' "${#1}" '' | tr ' ' '-')"; }
+hdr()  { if [ "$JSON" -eq 1 ]; then json_add_section "$*"; return 0; fi
+         printf '\n%s\n' "$*"; printf '%s\n' "$(printf '%*s' "${#1}" '' | tr ' ' '-')"; }
 
 DRY=1
 run() {
@@ -304,6 +316,8 @@ Usage: ./claude-profiles.sh <command> [options]
 Commands:
   plan        Show exactly what apply would do. Changes nothing. Start here.
   apply       Create the profiles and shared directory.
+  status      Fast, read-only daily summary: versions, which profile you are
+              in, each profile's account, shared data size, backup count.
   verify      Inspect the current state and report problems.
   rollback    Remove the profiles and shared dir created by this script.
   finalize    Delete the source profile (${SOURCE}) once the new setup has
@@ -347,6 +361,9 @@ Options:
                     is then required instead of a fresh one.
   --yes             skip confirmation prompts. REQUIRED when there is no
                     terminal to answer them, e.g. when run from Claude Code.
+  --json            with 'status' or 'verify', print one JSON object to
+                    stdout instead of the human-readable report. No colour,
+                    no other output. Exit status is unchanged.
   -h, --help        this text
 
 With none of --profiles/--main/--second and no conf file, plan and apply ask
@@ -371,7 +388,7 @@ EOF
 [ $# -eq 0 ] && { usage; exit 0; }
 
 case "${1:-}" in
-  plan|apply|verify|rollback|finalize) CMD="$1"; shift ;;
+  plan|apply|status|verify|rollback|finalize) CMD="$1"; shift ;;
   -h|--help) usage; exit 0 ;;
   *) die "unknown command '${1}'. Try --help." ;;
 esac
@@ -388,10 +405,25 @@ while [ $# -gt 0 ]; do
     --adopt)  ADOPT=1; shift ;;
     --no-backup) DO_BACKUP=0; shift ;;
     --yes)    ASSUME_YES=1; shift ;;
+    --json)   JSON=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option '${1}'. Try --help." ;;
   esac
 done
+
+# --json (status, verify only): a single JSON object on stdout instead of the
+# human-readable report. Force colour off regardless of [ -t 1 ], and open
+# the recorder file that json_add_section/json_add_item (defined just above
+# do_verify) append to; hdr/info/ok/warn route there instead of printing once
+# JSON=1. Plain variable assignments only here, not a function call: this
+# runs as top-level script code, before the functions further down the file
+# (including json_add_item itself) have been defined.
+if [ "$JSON" -eq 1 ]; then
+  C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_OFF=""
+  JSON_FILE="${TMPDIR:-/tmp}/.claude-profiles-json.$$"
+  : > "$JSON_FILE"
+  trap 'rm -f "$JSON_FILE"' EXIT
+fi
 
 case "$(uname -s)" in
   Darwin) OS="macos" ;;
@@ -1401,6 +1433,82 @@ record_conf_version() {
   ok "updated recorded Claude Code version to ${newv} in ${CONF_FILE}"
 }
 
+# -------------------------------------------------------------- json output --
+#
+# Used only by `status --json` and `verify --json`. hdr()/info()/ok()/warn()
+# (defined at the top of the file) already route to json_add_section/
+# json_add_item instead of printing once JSON=1; do_status() also reads its
+# own local variables directly to build its JSON object, since its shape is a
+# handful of fixed fields rather than the section/item list verify uses.
+
+json_esc() {
+  # Escapes backslash, double quote, tab and newline so $1 can sit inside a
+  # JSON string. Nothing else in these strings is exotic (paths, emails, org
+  # names, our own messages) so nothing else is escaped. The N;$!ba loop
+  # joins multi-line input first, so an embedded real newline (not just the
+  # \n two-character escape already handled by the tab rule above) becomes
+  # a literal \n instead of breaking the one-object-per-line JSON output.
+  # awk rather than sed: BSD sed does not understand \t in a pattern, and
+  # the tab and newline here must be matched literally on both userlands.
+  printf '%s' "$1" | awk 'BEGIN { ORS = "" }
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t")
+      if (NR > 1) printf "\\n"
+      printf "%s", $0 }'
+}
+
+json_add_section() {
+  # $1 = section name. Starts a new group that json_add_item() below appends
+  # to until the next json_add_section call. JSON_FILE is opened once, at
+  # option-parsing time, only when --json was given.
+  [ "$JSON" -eq 1 ] || return 0
+  printf 'S\t%s\n' "$(json_esc "$1")" >> "$JSON_FILE"
+}
+
+json_add_item() {
+  # $1 = level (ok|warn|info), $2 = text.
+  [ "$JSON" -eq 1 ] || return 0
+  printf 'I\t%s\t%s\n' "$1" "$(json_esc "$2")" >> "$JSON_FILE"
+}
+
+json_sections_json() {
+  # Renders JSON_FILE's S/I lines (both already json_esc()-escaped) as
+  # verify --json's "sections" array. One pass, no arrays needed: awk prints
+  # punctuation as each line streams past rather than building the tree in
+  # memory first.
+  awk -F'\t' '
+    BEGIN { printf "[" }
+    $1 == "S" {
+      if (nsec > 0) { printf "]}," }
+      nsec++
+      printf "{\"name\":\"%s\",\"items\":[", $2
+      nitem = 0
+      next
+    }
+    $1 == "I" {
+      if (nsec == 0) next
+      if (nitem > 0) { printf "," }
+      nitem++
+      printf "{\"level\":\"%s\",\"text\":\"%s\"}", $2, $3
+      next
+    }
+    END {
+      if (nsec > 0) { printf "]}" }
+      printf "]"
+    }
+  ' "$JSON_FILE"
+}
+
+json_emit_verify() {
+  # Called from the dispatcher after do_verify() returns, using the section/
+  # item trail it left in JSON_FILE and the problem count it left in
+  # VERIFY_PROBLEMS. Exit status is decided by the dispatcher, from the same
+  # do_verify() call, not from this function.
+  local ok_bool="true"
+  [ "$VERIFY_PROBLEMS" -eq 0 ] || ok_bool="false"
+  printf '{"command":"verify","version":"%s","problems":%s,"ok":%s,"sections":%s}\n' \
+    "$(json_esc "$VERSION")" "$VERIFY_PROBLEMS" "$ok_bool" "$(json_sections_json)"
+}
+
 do_verify() {
   local problems=0
   local cur
@@ -1665,6 +1773,8 @@ do_verify() {
     info "no ${CONF_FILE}; nothing recorded to compare against ${cur}"
   fi
 
+  VERIFY_PROBLEMS="$problems"
+
   hdr "Result"
   if [ "$problems" -eq 0 ]; then
     ok "no problems found"
@@ -1676,6 +1786,148 @@ do_verify() {
   if [ "$CONF_LOADED" -eq 1 ] && [ "${CONF_CLAUDE_VERSION:-}" != "$cur" ]; then
     record_conf_version "$cur"
   fi
+}
+
+# ------------------------------------------------------------------ status --
+#
+# The daily-use glance, as opposed to verify's health check: read-only, fast
+# (never calls `claude auth status` on a profile that has never been
+# launched, same rule as do_verify's Accounts section), and no "problems"
+# logic. Exit status is 0 unless the conf file is missing.
+
+do_status() {
+  [ "$CONF_LOADED" -eq 1 ] \
+    || die "no ${CONF_FILE}. 'status' only has something to report once you
+       have run 'apply'. Run 'plan' first to preview what that would do."
+
+  local cur name dir launcher is_first line l e o s marker
+  local json_profiles="" current_profile_json="null"
+  cur=$(claude_version)
+
+  hdr "Versions"
+  info "claude-profiles.sh : ${VERSION}"
+  info "claude              : ${cur}"
+  if [ -n "$CONF_CLAUDE_VERSION" ] && [ "$CONF_CLAUDE_VERSION" != "$cur" ]; then
+    info "recorded at apply   : ${CONF_CLAUDE_VERSION} (differs from current)"
+  fi
+
+  hdr "You are in"
+  local cur_desc="" cur_name=""
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    for name in $PROFILES; do
+      if same_path "${CLAUDE_CONFIG_DIR}" "$(profile_dir "$name")"; then
+        cur_name="$name"
+        break
+      fi
+    done
+    if [ -n "$cur_name" ]; then
+      cur_desc="$cur_name"
+    elif same_path "${CLAUDE_CONFIG_DIR}" "$SOURCE"; then
+      # shellcheck disable=SC2088
+      cur_desc="~/.claude (old profile)"
+    else
+      cur_desc="${CLAUDE_CONFIG_DIR}"
+    fi
+  else
+    # shellcheck disable=SC2088
+    cur_desc="~/.claude (old profile)"
+  fi
+  info "you are in: ${cur_desc}"
+  [ -n "$cur_name" ] && current_profile_json="\"$(json_esc "$cur_name")\""
+
+  hdr "Profiles"
+  local have_claude=0
+  command -v claude >/dev/null 2>&1 && have_claude=1
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    launcher="claude-${name}"
+    if [ "$name" = "$(first_profile)" ]; then is_first=1; else is_first=0; fi
+    marker=""
+    [ "$is_first" -eq 1 ] && marker="  (first: inherits login)"
+
+    local logged_json="null" email_json="null" org_json="null" plan_json="null" launched_json="false"
+    if profile_launched "$dir"; then
+      launched_json="true"
+      if [ "$have_claude" -eq 1 ]; then
+        line=$(profile_auth "$dir")
+        l=$(printf '%s' "$line" | cut -f1)
+        e=$(printf '%s' "$line" | cut -f2)
+        o=$(printf '%s' "$line" | cut -f3)
+        s=$(printf '%s' "$line" | cut -f4)
+        if [ "$l" = "true" ]; then
+          logged_json="true"
+          [ "$e" != "unset" ] && email_json="\"$(json_esc "$e")\""
+          [ "$o" != "unset" ] && org_json="\"$(json_esc "$o")\""
+          [ "$s" != "unset" ] && plan_json="\"$(json_esc "$s")\""
+          ok "${name} (${launcher}): ${e} (${o}, ${s})${marker}"
+        else
+          logged_json="false"
+          info "${name} (${launcher}): not logged in${marker}"
+        fi
+      else
+        info "${name} (${launcher}): launched, but 'claude' is not on PATH to check the account${marker}"
+      fi
+    else
+      info "${name} (${launcher}): not launched yet${marker}"
+    fi
+
+    json_profiles="${json_profiles}${json_profiles:+,}"'{"name":"'"$(json_esc "$name")"'","dir":"'"$(json_esc "$dir")"'","launcher":"'"$(json_esc "$launcher")"'","first":'"$( [ "$is_first" -eq 1 ] && printf true || printf false )"',"launched":'"$launched_json"',"logged_in":'"$logged_json"',"email":'"$email_json"',"org":'"$org_json"',"plan":'"$plan_json"'}'
+  done
+
+  hdr "Shared data"
+  local shared_kb proj_count trans_count
+  shared_kb=$(dir_kb "$SHARED")
+  if [ -d "${SHARED}/projects" ]; then
+    proj_count=$(find "${SHARED}/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  else
+    proj_count=0
+  fi
+  if [ -d "${SHARED}/projects" ]; then
+    trans_count=$(find "${SHARED}/projects" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+  else
+    trans_count=0
+  fi
+  info "size: $(kb_h "$shared_kb")   projects: ${proj_count}   transcripts: ${trans_count}   mode: ${SHARE_MODE}"
+
+  hdr "Backups"
+  local backup_count=0 backup_latest="" backup_latest_json="null"
+  if [ -d "$BACKUP_ROOT" ]; then
+    backup_count=$(find "$BACKUP_ROOT" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [ -f "${BACKUP_ROOT}/.latest" ]; then
+    backup_latest=$(basename "$(cat "${BACKUP_ROOT}/.latest" 2>/dev/null)" 2>/dev/null) || backup_latest=""
+    [ -n "$backup_latest" ] && backup_latest_json="\"$(json_esc "$backup_latest")\""
+  fi
+  info "count: ${backup_count}   latest: ${backup_latest:-none}"
+
+  local finalized_json="null" adopted_json="[]"
+  if [ -n "$CONF_FINALIZED" ] || [ -n "$CONF_ADOPTED" ]; then
+    hdr "Notes"
+    if [ -n "$CONF_FINALIZED" ]; then
+      info "finalized: ${CONF_FINALIZED} (${SOURCE} was removed)"
+      finalized_json="\"$(json_esc "$CONF_FINALIZED")\""
+    fi
+    if [ -n "$CONF_ADOPTED" ]; then
+      info "adopted: ${CONF_ADOPTED}"
+      local a items="" oifs="$IFS"
+      IFS=','
+      for a in $CONF_ADOPTED; do
+        items="${items}${items:+,}\"$(json_esc "$a")\""
+      done
+      IFS="$oifs"
+      adopted_json="[${items}]"
+    fi
+  fi
+
+  if [ "$JSON" -eq 1 ]; then
+    printf '{"command":"status","version":"%s","claude_version":"%s","current_profile":%s,"profiles":[%s],"shared":{"dir":"%s","mode":"%s","size_kb":%s,"projects":%s,"transcripts":%s},"backups":{"count":%s,"latest":%s},"finalized":%s,"adopted":%s}\n' \
+      "$(json_esc "$VERSION")" "$(json_esc "$cur")" "$current_profile_json" \
+      "$json_profiles" \
+      "$(json_esc "$SHARED")" "$(json_esc "$SHARE_MODE")" "$shared_kb" "$proj_count" "$trans_count" \
+      "$backup_count" "$backup_latest_json" \
+      "$finalized_json" "$adopted_json"
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------- rollback --
@@ -2128,9 +2380,16 @@ case "$CMD" in
     say "  checks nothing still points into it and no session is running on"
     say "  it, takes a fresh backup, and then asks. Do not rm -rf it by hand."
     ;;
+  status)
+    banner
+    do_status
+    ;;
   verify)
     banner
-    do_verify
+    vst=0
+    do_verify || vst=$?
+    [ "$JSON" -eq 1 ] && json_emit_verify
+    exit "$vst"
     ;;
   rollback)
     banner

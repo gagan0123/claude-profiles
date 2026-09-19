@@ -637,6 +637,56 @@ bash "$SCRIPT" finalize --yes > "$T/fin-again.out" 2>&1; rc=$?
 check "second finalize exits non-zero" "[ $rc -ne 0 ] && grep -qi 'nothing to remove' $T/fin-again.out"
 check "second finalize adds no second FINALIZED line" "[ \$(grep -c '^FINALIZED=' $HOME/.claude-shared/.claude-profiles.conf) -eq 1 ]"
 
+echo "=== status and json ==="
+# Reuses the state finalize left behind: ~/.claude gone (FINALIZED recorded
+# in the conf), work and personal both launched with distinct fake accounts
+# (work's copied source creds fall through the stub to me@example.com/
+# Personal/max, personal's FAKE-WORK creds give work@example.com/Work Org/
+# team), both settings.json agreeing on cleanupPeriodDays. That is exactly
+# the clean baseline `verify` needs, so it also works as the clean case for
+# `verify --json`.
+bash "$SCRIPT" status > "$T/status1.out" 2>&1; rc=$?
+check "status exits 0" "[ $rc -eq 0 ]"
+check "status lists both profiles by name and launcher" "grep -q 'work (claude-work)' $T/status1.out && grep -q 'personal (claude-personal)' $T/status1.out"
+check "status shows 'you are in'" "grep -q 'you are in:' $T/status1.out"
+
+CLAUDE_CONFIG_DIR="$HOME/.claude-personal" bash "$SCRIPT" status > "$T/status-cfg.out" 2>&1; rc=$?
+check "status with CLAUDE_CONFIG_DIR set names that profile" "[ $rc -eq 0 ] && grep -q 'you are in: personal' $T/status-cfg.out"
+
+bash "$SCRIPT" status --json > "$T/status.json" 2>"$T/status-json.err"; rc=$?
+check "status --json exits 0" "[ $rc -eq 0 ]"
+check "status --json is valid JSON" "python3 -m json.tool $T/status.json >/dev/null"
+check "status --json prints nothing but the JSON object (no banner, no colour)" "[ \$(wc -l < $T/status.json | tr -d ' ') -eq 1 ] && ! grep -qF \$'\\033[' $T/status.json"
+check "status --json .profiles length equals the profile count" "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if len(d[\"profiles\"])==2 else 1)' $T/status.json"
+check "status --json .profiles[0].first is true" "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"profiles\"][0][\"first\"] is True else 1)' $T/status.json"
+check "status --json .shared.mode is set" "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"shared\"][\"mode\"] else 1)' $T/status.json"
+
+bash "$SCRIPT" verify > "$T/verify-json-clean.txt" 2>&1; trc=$?
+bash "$SCRIPT" verify --json > "$T/verify-json-clean.json" 2>"$T/verify-json-clean.err"; jrc=$?
+check "verify --json is valid JSON (clean)" "python3 -m json.tool $T/verify-json-clean.json >/dev/null"
+check "verify --json .problems is an integer (clean)" "python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))[\"problems\"]; sys.exit(0 if isinstance(v,int) else 1)' $T/verify-json-clean.json"
+check "verify --json .sections is a non-empty array (clean)" "python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))[\"sections\"]; sys.exit(0 if isinstance(s,list) and len(s)>0 else 1)' $T/verify-json-clean.json"
+check "verify --json exit status matches the text run (clean)" "[ $jrc -eq $trc ]"
+check "verify text output still says Result and no problems found (clean)" "grep -q 'Result' $T/verify-json-clean.txt && grep -q 'no problems found' $T/verify-json-clean.txt"
+
+# Break something: a dangling shared link (same technique as the earlier
+# "dangling shared link detection" edge case), then compare the JSON and text
+# runs against each other on the broken state too.
+rm "$HOME/.claude-work/plans"; mkdir "$HOME/.claude-work/plans"
+bash "$SCRIPT" verify > "$T/verify-json-broken.txt" 2>&1; trc2=$?
+bash "$SCRIPT" verify --json > "$T/verify-json-broken.json" 2>"$T/verify-json-broken.err"; jrc2=$?
+check "verify --json .problems > 0 once broken" "[ \$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"problems\"])' $T/verify-json-broken.json) -gt 0 ]"
+check "verify --json .ok is false once broken" "python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))[\"ok\"] is False else 1)' $T/verify-json-broken.json"
+check "verify --json exit status is non-zero once broken" "[ $jrc2 -ne 0 ]"
+check "verify --json exit status matches the text run (broken)" "[ $jrc2 -eq $trc2 ]"
+rmdir "$HOME/.claude-work/plans"; ln -s "$HOME/.claude-shared/plans" "$HOME/.claude-work/plans"
+
+H9="$T/home_status_noconf"
+mkdir -p "$H9/.claude"
+printf '{"cleanupPeriodDays": 30}\n' > "$H9/.claude/settings.json"
+HOME="$H9" bash "$SCRIPT" status > "$T/status-noconf.out" 2>&1; rc=$?
+check "status with no conf exits non-zero" "[ $rc -ne 0 ]"
+
 echo
 echo "passed=$pass failed=$fail   (outputs in $T)"
 [ "$fail" -eq 0 ]
