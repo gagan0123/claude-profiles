@@ -12,15 +12,37 @@ Contents of this bundle:
 
 | File | What it is |
 |---|---|
-| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback` and `finalize` modes. |
+| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback`, `finalize`, `add`, `remove` and `status` modes. |
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
 | `ROLLBACK.md` | How to undo, at three levels of severity. |
 | `tests/e2e.sh` | End-to-end test against a throwaway fake home. Never touches the real `~/.claude`. |
 | `AGENTS.md` | For anyone changing the script: invariants, portability rules, how to test. |
-| `LICENSE` | GPL-2.0-or-later, the licence WordPress uses. |
+| `LICENSE` | GPL-2.0-or-later. |
 
 macOS and Linux only. See [Windows](#windows) below.
+
+---
+
+## Install
+
+The supported way to get this script is to clone the repository or download
+the release tarball, then either run it from the checkout — what the quick
+start below does — or copy `claude-profiles.sh` onto a directory on your
+`PATH`, such as `~/.local/bin/`:
+
+```bash
+install -m 755 claude-profiles.sh ~/.local/bin/
+```
+
+There is no curl-pipe-sh installer, on purpose: this script handles
+credentials, and you should read it before you run it, not pipe it straight
+into `bash` from a URL.
+
+Releases are tagged `vX.Y.Z` on GitHub
+(<https://github.com/gagan0123/claude-profiles/releases>). `verify` records
+which version of the script produced the setup and warns when the installed
+Claude Code version has moved on since the last `apply`.
 
 ---
 
@@ -79,6 +101,10 @@ Useful options:
 --no-backup      skip the tar archive (only sensible on a re-run of apply; for
                  finalize it requires an existing one instead of skipping)
 --yes            skip confirmations; required when no terminal can answer them
+--settings NAME=PATH  use PATH as that profile's settings.json instead of
+                 copying from ~/.claude (repeatable; full replacement, not a
+                 merge -- see "Day to day" below)
+--json           machine-readable output, for `status` and `verify` only
 ```
 
 `--main NAME` and `--second NAME` still work, as deprecated aliases for
@@ -89,6 +115,92 @@ combining them with `--profiles` is an error.
 are remembered in `~/.claude-shared/.claude-profiles.conf` after `apply`, so
 `verify` and `rollback` use the same values without you repeating them.
 Explicit flags always win.
+
+---
+
+## Day to day
+
+Once the setup exists, most sessions only need `status`, and occasionally
+`add`, `remove`, or `--json` for scripting against the other two.
+
+### `status`
+
+```bash
+./claude-profiles.sh status
+```
+
+Read-only: it changes nothing and always exits 0, so it is safe to run
+anywhere, including from a prompt or status-bar script. It prints the
+script's own version and the installed Claude Code version, names which
+profile (if any) the current terminal is running under, then gives one line
+per profile with its logged-in account, the shared-data size and file counts
+it sees, and finally a note on backups on disk and whether the setup has
+been finalized or holds any adopted profiles. Run it for a daily glance
+instead of the fuller `verify`.
+
+### `add` and `remove`
+
+```bash
+./claude-profiles.sh add acme --yes
+```
+
+Creates `~/.claude-acme` with its own fresh browser login, copies
+`settings.json` and `CLAUDE.md` from `~/.claude` if it still exists (or from
+the first profile in `PROFILES` if it does not -- see "Things that will
+surprise you" below), links it into the shared data, appends `acme` to
+`PROFILES` in the conf file, and regenerates the launcher snippet so
+`claude-acme` exists in a new shell. `add` also takes a comma-separated list
+to create several profiles in one call, and `--settings acme=PATH` to seed
+that profile's `settings.json` from somewhere other than the copy. It
+refuses a name already in `PROFILES`, and refuses a directory that already
+holds real data -- that is what `apply --adopt` is for, not `add`. Like
+every command that changes something, it fails closed without `--yes` when
+there is no terminal to confirm.
+
+```bash
+./claude-profiles.sh remove acme
+```
+
+Archives the whole `~/.claude-acme` to
+`~/.claude-backups/claude-acme-removed-<timestamp>.tar.gz`, deletes the
+directory, drops `acme` from `PROFILES`, and regenerates the launcher
+snippet. It leaves `~/.claude-shared` untouched -- see "Things that will
+surprise you" for what that means for the removed profile's transcripts. It
+refuses an unknown name, refuses if that profile's `sessions/` is non-empty
+(a session may still be running there), and refuses to remove the last
+remaining profile. Removing the first, login-inheriting profile is allowed
+but prints a warning, since it is the profile every later `add` seeds from.
+Asks for confirmation; needs `--yes` without a terminal.
+
+### `--settings NAME=PATH`
+
+Repeatable, on `plan`, `apply` and `add`. It is a full replacement for that
+profile's `settings.json`, not a merge with the copy from `~/.claude`: to
+change only a few keys, start from a copy of your own `settings.json` and
+edit those keys, rather than writing a settings file from scratch.
+
+```bash
+cp ~/.claude/settings.json .tmp/acme-settings.json
+# edit .tmp/acme-settings.json: change model, effortLevel, env as needed
+./claude-profiles.sh apply --profiles work,personal,acme \
+  --settings acme=.tmp/acme-settings.json --yes
+```
+
+It is ignored for a profile that already has a `settings.json` -- re-running
+`apply` never overwrites one -- is not recorded in the conf file, and does
+not support a path containing spaces.
+
+### `--json`
+
+```bash
+./claude-profiles.sh status --json
+```
+
+Available on both `status` and `verify`. Prints one JSON object to stdout in
+place of the human-readable report, with no colour codes, and keeps the same
+exit status as the plain form (so `verify --json` still exits nonzero when a
+check fails). Meant for a status bar, a prompt segment, or any script that
+wants to check profile health without parsing prose.
 
 ---
 
@@ -367,6 +479,24 @@ one profile is set to 7 days and another is on the 30-day default, the
 checks this and complains if any profile differs. Same trap applies to
 `claude project purge`: run it in any profile and it wipes the shared copy.
 
+**`add` after `finalize` seeds from the first profile, not from `~/.claude`.**
+Once `~/.claude` is gone there is nothing at the old location to copy
+`settings.json` and `CLAUDE.md` from, so a later
+`./claude-profiles.sh add newclient` copies them from whichever profile is
+listed first in `PROFILES` instead. Edit the new profile's `settings.json`
+by hand afterwards if the first profile's settings do not fit the new one,
+or pass `--settings newclient=PATH` on the same `add` command to do it in
+one step.
+
+**`remove` does not delete the removed profile's shared transcripts.** Only
+the profile directory itself is archived and deleted; `projects/` and the
+rest of `~/.claude-shared` are untouched, so a former client's sessions stay
+in the shared copy and stay resumable by every remaining profile with
+`--resume` or `--continue`. If that is not what you want once a client
+relationship ends, either delete that project's directory under
+`~/.claude-shared/projects` by hand, or use `--share safe` from the start so
+transcripts were never pooled in the first place.
+
 **Do not resume the same session from more than one profile at once.**
 Different sessions in the same project directory are fine. The same
 `.jsonl` open in two processes means two writers appending to one file, and
@@ -496,11 +626,50 @@ fixed the behaviour first.
 
 ## Windows
 
-Not supported by this script, and the shell approach alone is not sufficient
-there. Claude Code keeps global state in `~/.claude.json` outside the config
-directory, so multiple simultaneous instances sharing one real home directory
-step on each other regardless of `CLAUDE_CONFIG_DIR`. You need separate
-`USERPROFILE` values per instance. WSL works fine and this script runs there.
+Native Windows is not supported by this script, and the shell approach alone
+is not sufficient there: Claude Code keeps global state in `~/.claude.json`
+outside the config directory even on Windows, so multiple simultaneous
+instances sharing one real `%USERPROFILE%` step on each other regardless of
+`CLAUDE_CONFIG_DIR`. You would need separate `USERPROFILE` values per
+instance, which this script does not set up.
+
+**WSL 2 is a different case.** It is a full Linux userland with its own home
+directory, and by inspection this script should run there unchanged, against
+a Linux `~/.claude` exactly as on native Linux. Nobody has yet run
+`tests/e2e.sh` inside WSL, so treat what follows as read from the docs, not
+verified.
+
+- Claude Code installed inside WSL is an ordinary Linux install, not a
+  Windows one: the native installer's "macOS, Linux, WSL" tab uses the same
+  `curl -fsSL https://claude.ai/install.sh | bash`, and "you install and
+  launch `claude` inside the WSL terminal, not from PowerShell or CMD."
+  <https://code.claude.com/docs/en/setup#set-up-on-windows>
+- Its `~/.claude` therefore lives under the WSL distribution's own
+  `/home/<user>`, not under `%USERPROFILE%`. The docs' Windows-path note --
+  "On Windows, `~/.claude` resolves to `%USERPROFILE%\.claude`" -- is on the
+  same page but describes the native-Windows install; WSL's `~` is the Linux
+  home as on any other Linux box.
+  <https://code.claude.com/docs/en/claude-directory>
+- Credentials are the Linux file-based kind, not the Keychain: "On Linux,
+  credentials are stored in `~/.claude/.credentials.json` with file mode
+  `0600`" is the line that applies inside WSL, not the Windows or macOS
+  lines on the same page.
+  <https://code.claude.com/docs/en/authentication#credential-management>
+- Browser login under WSL2 commonly needs the terminal paste-code fallback:
+  "If your browser shows a login code instead of redirecting back after you
+  sign in, paste it into the terminal at the `Paste code here if prompted`
+  prompt. This happens when the browser can't reach Claude Code's local
+  callback server, which is common in WSL2, SSH sessions, and containers."
+  <https://code.claude.com/docs/en/authentication#log-in-to-claude-code>
+  The browser that opens is the Windows one, through WSL's default-browser
+  interop; that is WSL behaviour rather than anything the Claude Code docs
+  state.
+- The Windows-native Claude Code install (`%USERPROFILE%\.claude`) is a
+  wholly separate install from the one inside WSL, with its own `~/.claude`
+  and its own credentials. It is **not covered** by this script. Do not mix
+  the two: a `claude-work` launcher created from a WSL terminal has no
+  relationship to a native `claude` run from PowerShell or CMD on the same
+  machine.
 
 ---
 
@@ -525,5 +694,4 @@ former.
 
 ## License
 
-GPL-2.0-or-later, the licence WordPress uses. Copyright 2026 Gagan Deep
-Singh. The full licence text is in [`LICENSE`](LICENSE).
+GPL-2.0-or-later. Copyright 2026 Gagan Deep Singh. The full licence text is in [`LICENSE`](LICENSE).

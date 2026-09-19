@@ -35,6 +35,10 @@ and the failure modes, and you need both.
    cannot be answered from here; without `--yes` they stop with "No terminal
    is available". So `--yes` is how you pass on the user's approval, and it
    is only ever added *after* the user has approved that exact step in chat.
+7. **`remove` is destructive to that profile's own state**, even though it
+   archives the directory first: it deletes `~/.claude-<name>`, drops the
+   name from `PROFILES`, and regenerates the launcher snippet. Never run it
+   unless the user names that specific profile in this conversation.
 
 ## Procedure
 
@@ -185,6 +189,9 @@ profile should be listed. If it is not, check that
   `finalize` will refuse while such a reference is still there
 - that IDE extensions do not see the shell functions and will use `~/.claude`
   unless `CLAUDE_CONFIG_DIR` is set in the IDE's own environment
+- how to add a profile later: `./claude-profiles.sh add <name> --yes` after
+  the user approves
+- that they can run `status` any time for a glance
 
 ## If something fails
 

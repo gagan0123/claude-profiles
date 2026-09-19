@@ -107,8 +107,17 @@ launcher functions against a stub `claude` binary, a second `apply`,
 without the flag, archive, no-overwrite merge, history union, `.adopted-*`),
 a `--share safe` setup with custom names, a three-profile setup, a level-3
 restore from the backup archive, and `finalize` (each gate's refusal, then
-the real deletion and the state it leaves behind). It never reads or writes
-the real `~/.claude`.
+the real deletion and the state it leaves behind). It also covers `add`
+(fresh profile creation, refusal on a name already in `PROFILES`, refusal
+on a directory that already holds real data, conf and launcher snippet
+updated) and `remove` (archive-then-delete, refusal on an unknown name, on
+a non-empty `sessions/`, and on the last remaining profile, the warning on
+removing the first profile, shared data left untouched), `--settings
+NAME=PATH` on `plan`, `apply` and `add` (full-replacement copy, ignored
+when the profile already has a `settings.json`), and the `status` and
+`--json` output of both `status` and `verify` (shape of the JSON object,
+same exit status as the plain form). It never reads or writes the real
+`~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
 fix a bug, add the case that would have caught it first.
@@ -160,3 +169,9 @@ Types used here: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`. No
 message, the PR, or the changelog. Write the message to a file under `.tmp/`
 (gitignored) and commit with `git commit -F`, so multi-line bodies survive
 terminals that mangle pasted heredocs.
+
+**Releases:** bump `VERSION` in the script, commit
+`chore: release vX.Y.Z`, tag `vX.Y.Z`, then `gh release create` with the
+changelog since the previous tag. The tag and the `VERSION` string must
+match -- that is what lets `verify` report the script's own version
+correctly.

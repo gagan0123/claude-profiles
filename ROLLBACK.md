@@ -98,6 +98,51 @@ plain `claude` works again, using `~/.claude` exactly as before the setup.
 
 ---
 
+## Undoing `remove`
+
+`remove` archives the whole profile directory before deleting it, to
+`~/.claude-backups/claude-<name>-removed-<timestamp>.tar.gz`.
+
+**`add` is not the way back.** Running `./claude-profiles.sh add <name>`
+again creates a *fresh* profile with a fresh browser login; it does not know
+about the archive and will not restore the old credentials, trust decisions
+or anything else that lived in the removed directory.
+
+Instead, extract the archive and re-merge the profile:
+
+```bash
+ls -la ~/.claude-backups/claude-<name>-removed-*.tar.gz
+tar xzf ~/.claude-backups/claude-<name>-removed-<timestamp>.tar.gz -C "$HOME"
+```
+
+That puts `~/.claude-<name>` back exactly as it was at removal, as a path
+relative to your home directory. From there, two options:
+
+- If the shared copy in `~/.claude-shared` already has everything this
+  profile ever wrote (the common case, since `remove` never touches shared
+  data -- see the README's "Things that will surprise you"), simply add the
+  name back to the conf and re-run `apply` with the full profile list
+  including it, so it is re-linked and the launcher snippet regenerated:
+
+  ```bash
+  ./claude-profiles.sh apply --profiles work,personal,<name> --yes
+  ```
+
+- If you are not sure, or the directory held data that never made it into
+  the shared copy, run it through `--adopt` instead so anything missing is
+  merged in rather than assumed to already be there:
+
+  ```bash
+  ./claude-profiles.sh plan  --adopt --profiles work,personal,<name>
+  ./claude-profiles.sh apply --adopt --profiles work,personal,<name> --yes
+  ```
+
+Either way the extracted directory's own `.credentials.json` and
+`.claude.json` are left alone, so the restored profile keeps whichever
+account it was logged into before it was removed.
+
+---
+
 ## Level 3: restore from the backup archive
 
 Only needed if something modified `~/.claude` despite the design, you want to
