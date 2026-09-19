@@ -1,4 +1,6 @@
-# Two Claude Code accounts on one machine, sharing sessions
+# claude-profiles
+
+Two Claude Code accounts on one machine, sharing sessions.
 
 Run a work account and a personal account side by side on the same machine,
 both logged in at once, sharing session transcripts, prompt history,
@@ -8,7 +10,7 @@ Contents of this bundle:
 
 | File | What it is |
 |---|---|
-| `claude-profiles.sh` | The setup script. Has `plan`, `apply`, `verify`, `rollback` and `finalize` modes. |
+| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback` and `finalize` modes. |
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
 | `ROLLBACK.md` | How to undo, at three levels of severity. |

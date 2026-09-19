@@ -86,10 +86,10 @@ macOS, and the **BSD userland**, because that is what macOS ships. Concretely:
 - The launcher snippet is sourced by **both bash and zsh**. Function names
   with hyphens (`claude-work`) are fine in both; keep the body POSIX-ish.
 
-Run `shellcheck -s bash` on both scripts before committing. The three
+Run `shellcheck -s bash` on both scripts before committing. The
 `# shellcheck disable=` comments in `claude-profiles.sh` cover literal
-strings that must contain `~` and `$HOME` unexpanded; do not add more
-without a comment saying why.
+strings that must contain `~` and `$HOME` unexpanded, and awk programs held
+in variables; do not add more without a comment saying why.
 
 ## How to test
 
