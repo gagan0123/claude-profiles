@@ -51,6 +51,7 @@ CMD=""
 # so `verify` and `rollback` do not need the flags repeated.
 MAIN_SET=0; SECOND_SET=0; SHARE_SET=0; SOURCE_SET=0
 CONF_LOADED=0
+CONF_CLAUDE_VERSION=""
 
 # Session data. "full" gives you cross-profile --resume and --continue.
 # "safe" deliberately leaves transcripts and checkpoints per-profile so that
@@ -130,6 +131,26 @@ dir_kb() {
   local s
   s=$(du -sk "$1" 2>/dev/null | cut -f1) || s=0
   printf '%s' "${s:-0}"
+}
+
+claude_version() {
+  # First whitespace-separated token of `claude --version`, e.g. "2.1.278"
+  # from "2.1.278 (Claude Code)". "unknown" if claude is missing or the
+  # command fails. Must never abort the script, even under set -e: every
+  # failure path below is guarded by an explicit condition, not left to
+  # propagate.
+  local out first
+  if command -v claude >/dev/null 2>&1; then
+    out=$(claude --version 2>/dev/null) || out=""
+  else
+    out=""
+  fi
+  first=$(printf '%s\n' "$out" | awk '{print $1; exit}')
+  if [ -n "$first" ]; then
+    printf '%s' "$first"
+  else
+    printf '%s' "unknown"
+  fi
 }
 
 same_path() {
@@ -238,6 +259,7 @@ if [ -f "$CONF_FILE" ]; then
       SECOND)     if [ "$SECOND_SET" -eq 0 ]; then SECOND="$v";     fi ;;
       SHARE_MODE) if [ "$SHARE_SET"  -eq 0 ]; then SHARE_MODE="$v"; fi ;;
       SOURCE)     if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
+      CLAUDE_VERSION) CONF_CLAUDE_VERSION="$v" ;;
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
@@ -448,7 +470,7 @@ seed_shared() {
 
 write_conf() {
   if [ "$DRY" -eq 1 ]; then
-    info "would record MAIN/SECOND/SHARE_MODE/SOURCE in ${CONF_FILE}"
+    info "would record MAIN/SECOND/SHARE_MODE/SOURCE/CLAUDE_VERSION in ${CONF_FILE}"
     return 0
   fi
   {
@@ -457,6 +479,7 @@ write_conf() {
     printf 'SECOND=%s\n'     "$SECOND"
     printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
     printf 'SOURCE=%s\n'     "$SOURCE"
+    printf 'CLAUDE_VERSION=%s\n' "$(claude_version)"
   } > "$CONF_FILE"
   ok "recorded settings in ${CONF_FILE}"
 }
@@ -656,8 +679,27 @@ refs_old_profile() {
   return 1
 }
 
+record_conf_version() {
+  # Rewrite just the CLAUDE_VERSION= line of CONF_FILE. Portable: no sed -i.
+  # Build the new content in a temp file in the same directory, then mv.
+  local newv="$1" tmp line wrote=0
+  tmp="$(dirname "$CONF_FILE")/.$(basename "$CONF_FILE").tmp.$$"
+  : > "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\n' "$newv" >> "$tmp"; wrote=1 ;;
+      *)                printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONF_FILE"
+  [ "$wrote" -eq 1 ] || printf 'CLAUDE_VERSION=%s\n' "$newv" >> "$tmp"
+  mv "$tmp" "$CONF_FILE"
+  ok "updated recorded Claude Code version to ${newv} in ${CONF_FILE}"
+}
+
 do_verify() {
   local problems=0
+  local cur
+  cur=$(claude_version)
 
   hdr "Directories"
   local d
@@ -795,12 +837,31 @@ do_verify() {
     problems=$((problems+1))
   fi
 
+  hdr "Claude Code version"
+  if [ "$CONF_LOADED" -eq 1 ]; then
+    info "recorded at apply time : ${CONF_CLAUDE_VERSION:-unknown}"
+    info "current                : ${cur}"
+    if [ "${CONF_CLAUDE_VERSION:-}" != "$cur" ]; then
+      warn "recorded and current Claude Code versions differ. The checks above"
+      warn "just ran against the new version; this design depends on"
+      warn "documented behaviour that can change between versions. Not a problem."
+    else
+      ok "matches the version recorded at apply time"
+    fi
+  else
+    info "no ${CONF_FILE}; nothing recorded to compare against ${cur}"
+  fi
+
   hdr "Result"
   if [ "$problems" -eq 0 ]; then
     ok "no problems found"
   else
     warn "${problems} problem(s) above"
     return 1
+  fi
+
+  if [ "$CONF_LOADED" -eq 1 ] && [ "${CONF_CLAUDE_VERSION:-}" != "$cur" ]; then
+    record_conf_version "$cur"
   fi
 }
 

@@ -77,7 +77,16 @@ check "bashrc sources snippet once" "[ \$(grep -c 'claude-profiles.sh' $HOME/.ba
 echo "=== snippet behaviour in bash ==="
 out=$(bash -c ". $HOME/.claude-profiles.sh; claude --version" 2>&1); rc=$?
 check "bare claude blocked" "[ $rc -ne 0 ] && printf '%s' \"$out\" | grep -q 'Pick a profile'"
-mkdir -p "$T/bin"; printf '#!/bin/sh\necho "CFG=${CLAUDE_CONFIG_DIR:-unset} ARGS=$*"\n' > "$T/bin/claude"; chmod +x "$T/bin/claude"
+mkdir -p "$T/bin"
+{
+  printf '#!/bin/sh\n'
+  printf 'if [ "$1" = "--version" ]; then\n'
+  printf '  echo "9.9.9 (Claude Code)"\n'
+  printf '  exit 0\n'
+  printf 'fi\n'
+  printf 'echo "CFG=${CLAUDE_CONFIG_DIR:-unset} ARGS=$*"\n'
+} > "$T/bin/claude"
+chmod +x "$T/bin/claude"
 out=$(PATH="$T/bin:$PATH" bash -c ". $HOME/.claude-profiles.sh; claude-work --resume x")
 check "claude-work sets CLAUDE_CONFIG_DIR and passes args" "[ \"$out\" = 'CFG=$HOME/.claude-work ARGS=--resume x' ]"
 out=$(PATH="$T/bin:$PATH" CLAUDE_CONFIG_DIR=/elsewhere bash -c ". $HOME/.claude-profiles.sh; claude mcp list")
@@ -110,6 +119,18 @@ check "verify flags symlinked credentials" "[ $rc -ne 0 ] && grep -q 'SYMLINK' $
 rm "$HOME/.claude-work/.credentials.json"; cp "$C/.credentials.json" "$HOME/.claude-work/.credentials.json"
 bash "$SCRIPT" verify > "$T/verify5.out" 2>&1; rc=$?
 check "verify clean after fixes" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify5.out"
+
+echo "=== Claude Code version tracking ==="
+CONF="$HOME/.claude-shared/.claude-profiles.conf"
+check "conf has a CLAUDE_VERSION line after apply" "grep -q '^CLAUDE_VERSION=' $CONF"
+PATH="$T/bin:$PATH" bash "$SCRIPT" verify > "$T/verify-ver1.out" 2>&1; rc=$?
+check "verify with claude stub on PATH exits 0" "[ $rc -eq 0 ]"
+check "conf CLAUDE_VERSION now matches the stub's version" "grep -q '^CLAUDE_VERSION=9.9.9$' $CONF"
+grep -v '^CLAUDE_VERSION=' "$CONF" > "$T/conf.tmp" && printf 'CLAUDE_VERSION=1.0.0\n' >> "$T/conf.tmp" && mv "$T/conf.tmp" "$CONF"
+PATH="$T/bin:$PATH" bash "$SCRIPT" verify > "$T/verify-ver2.out" 2>&1; rc=$?
+check "verify warns about version drift" "grep -qi 'versions differ' $T/verify-ver2.out"
+check "version drift is not counted as a problem" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify-ver2.out"
+check "conf CLAUDE_VERSION updated back to current after clean verify" "grep -q '^CLAUDE_VERSION=9.9.9$' $CONF"
 
 echo "=== bad inputs ==="
 bash "$SCRIPT" plan --main 'bad name' >/dev/null 2>&1; check "rejects name with space" "[ $? -ne 0 ]"
