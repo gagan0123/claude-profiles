@@ -14,8 +14,48 @@ Contents of this bundle:
 | `ROLLBACK.md` | How to undo, at three levels of severity. |
 | `tests/e2e.sh` | End-to-end test against a throwaway fake home. Never touches the real `~/.claude`. |
 | `AGENTS.md` | For anyone changing the script: invariants, portability rules, how to test. |
+| `LICENSE` | GPL-2.0-or-later, the licence WordPress uses. |
 
 macOS and Linux only. See [Windows](#windows) below.
+
+---
+
+## Quick start
+
+Before running `apply`, make the one decision that matters: see
+[Choose your sharing mode](#choose-your-sharing-mode-before-you-run-this).
+
+```bash
+chmod +x claude-profiles.sh
+
+./claude-profiles.sh plan                    # read the output, change nothing
+./claude-profiles.sh apply --shell --share full   # do it; --share safe is the alternative
+
+# open a NEW terminal
+claude-work                          # should already be logged in
+# quit, then:
+claude-personal                      # browser login, second account
+# quit, then:
+./claude-profiles.sh verify
+```
+
+Useful options:
+
+```
+--main NAME      name of the profile that inherits your current login (default: work)
+--second NAME    name of the second profile (default: personal)
+--share full     share transcripts too (default)
+--share safe     do NOT share transcripts, see below
+--source DIR     seed from a profile other than ~/.claude
+--shell          append the source line to your .zshrc / .bashrc for you
+--no-backup      skip the tar archive (only sensible on a re-run of apply)
+--yes            skip confirmations; required when no terminal can answer them
+```
+
+`--main`, `--second`, `--share` and `--source` are remembered in
+`~/.claude-shared/.claude-profiles.conf` after `apply`, so `verify` and
+`rollback` use the same values without you repeating them. Explicit flags
+always win.
 
 ---
 
@@ -110,42 +150,6 @@ reclaim the space, after checking the "settings that still point at
 
 ---
 
-## Quick start
-
-```bash
-chmod +x claude-profiles.sh
-
-./claude-profiles.sh plan            # read the output, change nothing
-./claude-profiles.sh apply --shell   # do it, and wire up the shell rc file
-
-# open a NEW terminal
-claude-work                          # should already be logged in
-# quit, then:
-claude-personal                      # browser login, second account
-# quit, then:
-./claude-profiles.sh verify
-```
-
-Useful options:
-
-```
---main NAME      name of the profile that inherits your current login (default: work)
---second NAME    name of the second profile (default: personal)
---share full     share transcripts too (default)
---share safe     do NOT share transcripts, see below
---source DIR     seed from a profile other than ~/.claude
---shell          append the source line to your .zshrc / .bashrc for you
---no-backup      skip the tar archive (only sensible on a re-run of apply)
---yes            skip confirmations; required when no terminal can answer them
-```
-
-`--main`, `--second`, `--share` and `--source` are remembered in
-`~/.claude-shared/.claude-profiles.conf` after `apply`, so `verify` and
-`rollback` use the same values without you repeating them. Explicit flags
-always win.
-
----
-
 ## Choose your sharing mode before you run this
 
 This is the one decision worth thinking about rather than accepting the
@@ -164,6 +168,11 @@ default.
 
 **`--share safe`** shares only `history.jsonl`, `plans/`, `paste-cache/` and
 the config directories. Transcripts and checkpoints stay per profile.
+**Safe mode still shares `history.jsonl`, which holds every prompt typed under
+either account together with its project path, so a confidential prompt typed
+under the work account is recallable with the up arrow under the personal
+one.** Anyone who needs prompts kept apart must not use this script's
+sharing at all.
 
 The reason `safe` exists: transcripts are plaintext and unencrypted on disk,
 and the Claude Code docs are explicit that anything passing through a tool
@@ -319,3 +328,10 @@ former.
 - [Authentication, "Credential management"](https://code.claude.com/docs/en/authentication#credential-management) — per-platform credential storage, and the statement that `CLAUDE_CONFIG_DIR` keys both the credentials file and the macOS Keychain entry
 - [Retention (`cleanupPeriodDays`)](https://code.claude.com/docs/en/claude-directory) — which paths the age sweep deletes; note it covers `plans/` and `paste-cache/`, which are shared in both modes
 - [Issue #33430](https://github.com/anthropics/claude-code/issues/33430) — `CLAUDE_CONFIG_DIR` is undocumented; track it for changes
+
+---
+
+## License
+
+GPL-2.0-or-later, the licence WordPress uses. Copyright 2026 Gagan Deep
+Singh. The full licence text is in [`LICENSE`](LICENSE).
