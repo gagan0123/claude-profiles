@@ -1,0 +1,135 @@
+# AGENTS.md
+
+Guidance for any agent (or person) changing this repository. It is short on
+purpose; the safety model in `README.md` is the actual specification.
+
+Two different audiences use this repo, and they need different files:
+
+- **Someone running the setup on their machine** pastes
+  `INSTRUCTIONS-FOR-CLAUDE.md` into Claude Code. That file is a procedure for
+  an *operator* agent and must stay self-contained. Do not put development
+  notes in it.
+- **Someone changing the script or docs** reads this file.
+
+## What the script must never do
+
+These are the invariants every change is measured against. Breaking one is a
+bug even if every test passes.
+
+1. **`~/.claude` (the `--source` profile) is read-only.** No writes, no
+   deletes, no symlinks created inside it, no `mv`. The only allowed
+   operations on it are `cp` *from* it, `tar` *of* it, and `du`/`ls`/`test`.
+   `tests/e2e.sh` fingerprints the source tree before and after every command
+   and fails if a byte, mode or mtime moved. Keep it that way.
+2. **`.credentials.json`, `.claude.json` and `sessions/` are per-profile real
+   files, never symlinks, never shared.** The `PRIVATE` list in the script
+   and the "Credential isolation" section of `verify` enforce this.
+3. **Nothing logs anyone out.** The script never runs `claude`, never runs
+   `/logout`, never deletes or rewrites a credentials file it did not just
+   create by copying. The docs say `/logout` can revoke the refresh token;
+   treat that as true.
+4. **`plan` changes nothing.** Every filesystem write goes through `run`, or
+   is explicitly branched on `DRY`. A new write that bypasses both is a bug.
+5. **`apply` must be idempotent and interruptible.** Re-running must skip
+   what exists; an interrupted copy must not look finished (that is why
+   shared paths are copied to `.<name>.partial` and renamed).
+6. **Prompts fail closed.** If there is no terminal, `confirm` returns false
+   and says to pass `--yes`. Never fall back to "assume yes".
+7. **The backup is taken and read back before anything else is created**,
+   and lives in a mode-700 directory as a mode-600 file, because it contains
+   credentials.
+
+## Portability rules (the script runs on macOS and Linux)
+
+The script targets **bash 3.2**, because that is what `/bin/bash` is on
+macOS, and the **BSD userland**, because that is what macOS ships. Concretely:
+
+- No arrays, no `[[ ]]`, no `${var,,}`, no `mapfile`, no `declare -A`, no
+  `printf -v`, no `read -d`, no `+=` on strings you rely on.
+- `readlink` **without** `-f`. `realpath` does not exist on older macOS.
+  Use `cd dir && pwd -P` to canonicalise.
+- `stat` flags differ completely between GNU and BSD. The script does not
+  use `stat` at all; `tests/e2e.sh` wraps it in `fmode`/`fmtime`.
+- `du -sk`, `df -Pk`, `cp -Rp`, `tar czf`/`tzf`, `grep -qF`, `sed -n 's///p'`
+  with basic regex, `awk` with `-v`, `cut -f`, `tr`, `wc -w | tr -d ' '`
+  (BSD `wc` pads with spaces) are the agreed subset. Nothing else without
+  checking the BSD man page.
+- `tar` positional `-C` works in both GNU tar and bsdtar; that is how the
+  backup adds `.claude.json` from a different directory.
+- `date +%Y%m%d-%H%M%S` only. No `date -d`, no `date -r`.
+- `ls --time-style`, `md5sum`, `timeout`, `mktemp --suffix` and `sed -i`
+  without a suffix argument are all GNU-only. Do not add them.
+- Shell rc detection is by `$SHELL` basename: zsh gets `.zshrc`, bash gets
+  `.bash_profile` on macOS and `.bashrc` on Linux. Anything else gets a
+  printed line to add by hand.
+- The launcher snippet is sourced by **both bash and zsh**. Function names
+  with hyphens (`claude-work`) are fine in both; keep the body POSIX-ish.
+
+Run `shellcheck -s bash` on both scripts before committing. The three
+`# shellcheck disable=` comments in `claude-profiles.sh` cover literal
+strings that must contain `~` and `$HOME` unexpanded; do not add more
+without a comment saying why.
+
+## How to test
+
+```bash
+tests/e2e.sh
+```
+
+It builds a fake `$HOME` under `$TMPDIR`, seeds a fake `~/.claude`, and runs
+`plan`, an `apply` without a TTY (must abort), `apply --yes --shell`, the
+launcher functions against a stub `claude` binary, a second `apply`,
+`verify` in clean and deliberately broken states, bad-input rejection,
+`rollback`, a `--share safe` setup with custom names, and a level-3 restore
+from the backup archive. It never reads or writes the real `~/.claude`.
+
+Every behavioural change to the script needs a check in that file. If you
+fix a bug, add the case that would have caught it first.
+
+There is no CI. Run the test on both platforms if you can; at minimum run it
+on the one you are on and say in the commit body which one that was.
+
+## Facts the design depends on (verified 2026-09-20 against the docs)
+
+Re-verify these when a change touches them, and update the README references
+if the docs move.
+
+- With `CLAUDE_CONFIG_DIR` set, *every* `~/.claude` path, including
+  `.claude.json`, lives under that directory.
+  <https://code.claude.com/docs/en/claude-directory>
+- With `CLAUDE_CONFIG_DIR` set, `.credentials.json` lives there too, and on
+  macOS the Keychain entry is keyed to that directory, so each profile gets
+  its own login. On a Mac where the Keychain is locked (SSH), Claude Code
+  falls back to the file.
+  <https://code.claude.com/docs/en/authentication#credential-management>
+- `cleanupPeriodDays` sweeps `projects/`, `file-history/`, `plans/`,
+  `paste-cache/`, `image-cache/`, `uploads/`, `session-env/`, `tasks/`, so
+  the two profiles must agree on it. `todos/` is legacy and not written.
+- `/logout` "removes and revokes the credential", which is why the setup
+  never asks anyone to log out.
+
+## Docs conventions
+
+- `README.md` explains the design and the traps. `ROLLBACK.md` is the undo
+  procedure. `INSTRUCTIONS-FOR-CLAUDE.md` is the operator script. A change
+  to script behaviour usually touches all three; check each.
+- Quote the docs when a claim rests on them, and link the page. Prefer "the
+  docs say X" over "X is true".
+- No emojis. No "generated by" lines. The history reads as the author's work.
+
+## Commits
+
+Conventional Commits with a body, always:
+
+```
+type(scope): imperative subject
+
+Why the change was needed, what was decided, what was rejected. Say which
+platform the tests ran on.
+```
+
+Types used here: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`. No
+`Co-Authored-By` lines and no tool or model attribution anywhere in the
+message, the PR, or the changelog. Write the message to a file under `.tmp/`
+(gitignored) and commit with `git commit -F`, so multi-line bodies survive
+terminals that mangle pasted heredocs.
