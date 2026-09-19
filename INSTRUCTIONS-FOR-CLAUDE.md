@@ -114,9 +114,12 @@ isolated. Point the user at the README section "If verify flags .claude.json"
 and do not proceed. (The main profile received a copy of `.claude.json` at
 setup, so its presence proves nothing; the second profile's does.)
 
-The "Settings that still point at ~/.claude" section is informational: it
-means a `statusLine` command or hook path lives under `~/.claude` and the
-user must keep that directory or repoint the setting. Tell them either way.
+The "Settings that still point at ~/.claude" section is informational:
+`apply` already relocates a `statusLine` command or hook path under
+`~/.claude` into `~/.claude-shared` and repoints the setting, so a
+reference this section still flags means that script did not exist under
+`~/.claude` at apply time (or was added since). Tell the user to re-run
+`apply` (safe to repeat) or repoint the setting by hand.
 
 **Step 7. Prove the sharing works.** In a project directory the user has used
 before, have them run `claude-work`, send one message, quit, then run

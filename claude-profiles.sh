@@ -485,6 +485,108 @@ write_conf() {
   ok "recorded settings in ${CONF_FILE}"
 }
 
+# ------------------------------------------------------- settings scripts --
+
+find_old_claude_paths() {
+  # Print every occurrence in $1 of ~/.claude/<rel>, $HOME/.claude/<rel>, or
+  # the literal $HOME path + /.claude/<rel>, one per line, deduped. <rel>
+  # ends at the next '"', whitespace, or end of the match: conservative on
+  # purpose. grep -oE only -- -P is not portable, -E is (GNU and BSD grep).
+  local file="$1" home_esc excl p1 p2 p3
+  [ -f "$file" ] || return 0
+  home_esc=$(printf '%s' "$HOME" | sed 's/[.[\^$*+?(){}|]/\\&/g')
+  excl='[^"[:space:]]+'
+  # Literal patterns on purpose, same three spellings as refs_old_profile.
+  # shellcheck disable=SC2088
+  p1='~/\.claude/'"$excl"
+  # shellcheck disable=SC2016
+  p2='\$HOME/\.claude/'"$excl"
+  p3="$home_esc"'/\.claude/'"$excl"
+  { grep -oE "$p1" "$file" 2>/dev/null || true
+    grep -oE "$p2" "$file" 2>/dev/null || true
+    grep -oE "$p3" "$file" 2>/dev/null || true
+  } | sort -u
+}
+
+relocate_settings_scripts() {
+  # A statusLine command or hook path copied verbatim from $SOURCE's
+  # settings.json keeps pointing at $SOURCE, which breaks the day it is
+  # deleted. Copy the referenced script into $SHARED once, and repoint the
+  # profile's own settings.json at ~/.claude-shared/<rel>. $SOURCE is only
+  # ever read here; only the profile's copy of settings.json is rewritten.
+  local dir="$1" target scan_from candidates
+  target="${dir}/settings.json"
+  scan_from="$target"
+  if [ ! -f "$target" ]; then
+    # plan: run() never actually copies settings.json into $dir, so preview
+    # against SOURCE's copy instead -- it is what apply would have copied.
+    [ -f "${SOURCE}/settings.json" ] || return 0
+    scan_from="${SOURCE}/settings.json"
+  fi
+
+  candidates=$(find_old_claude_paths "$scan_from")
+  [ -n "$candidates" ] || return 0
+
+  # Prefixes held in variables: a quoted literal inside ${c#...} is parsed
+  # differently by bash 3.2 and 4.3+, a variable is not.
+  local c rel src_file dest_file new_path tmp_settings
+  # shellcheck disable=SC2088,SC2016
+  local pre_tilde='~/.claude/' pre_var='$HOME/.claude/' pre_lit="${HOME}/.claude/"
+  for c in $candidates; do
+    case "$c" in
+      "$pre_tilde"*) rel="${c#"$pre_tilde"}" ;;
+      "$pre_var"*)   rel="${c#"$pre_var"}" ;;
+      "$pre_lit"*)   rel="${c#"$pre_lit"}" ;;
+      *) continue ;;
+    esac
+    [ -n "$rel" ] || continue
+
+    src_file="${SOURCE}/${rel}"
+    dest_file="${SHARED}/${rel}"
+    # shellcheck disable=SC2088
+    new_path="~/.claude-shared/${rel}"
+
+    if [ ! -f "$src_file" ]; then
+      if [ -d "$src_file" ]; then
+        warn "'${c}' in ${target} points at a directory (${src_file}), not a"
+        warn "script. Left as is."
+      else
+        warn "'${c}' in ${target} has no file at ${src_file}. Left as is:"
+        warn "the script did not exist under ${SOURCE} to relocate."
+      fi
+      continue
+    fi
+
+    if [ -e "$dest_file" ]; then
+      info "keep   ${rel} (already in ${SHARED})"
+    else
+      info "copy   ${rel} <- ${src_file}"
+      run mkdir -p "$(dirname "$dest_file")"
+      run cp -p "$src_file" "$dest_file"
+    fi
+
+    if [ "$DRY" -eq 1 ]; then
+      printf '%s\n' "  ${C_DIM}would run:${C_OFF} rewrite ${target}: '${c}' -> '${new_path}'"
+    else
+      tmp_settings="$(dirname "$target")/.$(basename "$target").reloc.$$"
+      awk -v old="$c" -v new="$new_path" '
+        {
+          line = $0
+          out = ""
+          oldlen = length(old)
+          while ((i = index(line, old)) > 0) {
+            out = out substr(line, 1, i - 1) new
+            line = substr(line, i + oldlen)
+          }
+          print out line
+        }
+      ' "$target" > "$tmp_settings"
+      mv "$tmp_settings" "$target"
+      info "rewrite ${target}: '${c}' -> '${new_path}'"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------- profiles --
 
 make_profile() {
@@ -503,6 +605,8 @@ make_profile() {
       run cp -Rp "$src" "${dir}/${p}"
     fi
   done
+
+  relocate_settings_scripts "$dir"
 
   if [ "$inherit" = "yes" ]; then
     if [ -f "${dir}/.credentials.json" ]; then
@@ -803,12 +907,17 @@ do_verify() {
   fi
 
   hdr "Settings that still point at ${SOURCE}"
-  local refs=0
+  local refs=0 extra
   for dir in "$MAIN_DIR" "$SECOND_DIR"; do
     if refs_old_profile "${dir}/settings.json"; then
       warn "$(basename "$dir")/settings.json references paths under ~/.claude/"
-      warn "(statusLine command, hooks, or similar). Those keep working only"
-      warn "while ${SOURCE} exists. Repoint them before you delete it."
+      warn "(statusLine command, hooks, or similar). apply relocates scripts"
+      warn "like this into ${SHARED} automatically and repoints the setting;"
+      warn "a reference still here means that script did not exist under"
+      warn "${SOURCE} at apply time (or was added since). Re-run apply (it"
+      warn "is idempotent), or fix the path in settings.json by hand."
+      extra=$(find_old_claude_paths "${dir}/settings.json" | tr '\n' ' ')
+      [ -n "$extra" ] && warn "still there: ${extra}"
       refs=1
     fi
   done

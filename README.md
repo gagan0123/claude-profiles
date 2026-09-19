@@ -222,11 +222,16 @@ project-level `.mcp.json` at the repo root, which both profiles read.
 
 **Settings that point back at `~/.claude` by absolute path.** A `statusLine`
 command such as `~/.claude/statusline.sh`, or a hook script kept under
-`~/.claude/hooks/`, is copied into both profiles' `settings.json` *still
-pointing at `~/.claude`*. That works as long as `~/.claude` exists, and
-breaks the day you delete it to reclaim space. `verify` warns when it sees
-such a reference. Move the script into the shared directory and repoint the
-setting, or just keep `~/.claude`.
+`~/.claude/hooks/`, would otherwise be copied into both profiles'
+`settings.json` *still pointing at `~/.claude`*, which only works as long as
+`~/.claude` exists. `apply` fixes this itself: it copies any script that
+`settings.json` points at under `~/.claude/`, `$HOME/.claude/`, or your
+literal home path into `~/.claude-shared/`, then rewrites the setting in
+each profile's own `settings.json` to `~/.claude-shared/<path>`. It is
+idempotent and never touches `~/.claude` itself. `verify` reports anything
+it could not relocate this way -- normally a script that did not exist
+under `~/.claude` at apply time, or was added since. Re-run `apply` (safe
+to repeat) or fix the path in `settings.json` by hand.
 
 **IDE extensions do not know about profiles.** The VS Code and JetBrains
 extensions launch and discover Claude Code without your shell functions, so
