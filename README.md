@@ -203,7 +203,10 @@ storage").
 
 `verify` checks that `.credentials.json`, `.claude.json` and `sessions/` are
 real files or directories in each profile, never symlinks, and that nothing
-inside `~/.claude` points at the new directories.
+inside `~/.claude` points at the new directories. It also asks the binary
+itself, via `claude auth status --json`, which account each launched
+profile is logged into, and refuses to pass if both profiles report the
+same account.
 
 ---
 

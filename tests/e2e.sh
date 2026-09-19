@@ -87,15 +87,35 @@ echo "=== snippet behaviour in bash ==="
 out=$(bash -c ". $HOME/.claude-profiles.sh; claude --version" 2>&1); rc=$?
 check "bare claude blocked" "[ $rc -ne 0 ] && printf '%s' \"$out\" | grep -q 'Pick a profile'"
 mkdir -p "$T/bin"
-{
-  printf '#!/bin/sh\n'
-  printf 'if [ "$1" = "--version" ]; then\n'
-  printf '  echo "9.9.9 (Claude Code)"\n'
-  printf '  exit 0\n'
-  printf 'fi\n'
-  printf 'echo "CFG=${CLAUDE_CONFIG_DIR:-unset} ARGS=$*"\n'
-} > "$T/bin/claude"
+cat > "$T/bin/claude" <<'STUB'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "9.9.9 (Claude Code)"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  creds="$CLAUDE_CONFIG_DIR/.credentials.json"
+  if [ ! -f "$creds" ]; then
+    echo '{"loggedIn": false, "authMethod": "none"}'
+    exit 1
+  fi
+  if grep -q FAKE-WORK "$creds" 2>/dev/null; then
+    echo '{"loggedIn": true, "authMethod": "claude.ai", "email": "work@example.com", "orgName": "Work Org", "subscriptionType": "team"}'
+    exit 0
+  fi
+  echo '{"loggedIn": true, "authMethod": "claude.ai", "email": "me@example.com", "orgName": "Personal", "subscriptionType": "max"}'
+  exit 0
+fi
+echo "CFG=${CLAUDE_CONFIG_DIR:-unset} ARGS=$*"
+STUB
 chmod +x "$T/bin/claude"
+# From here on, every claude-profiles.sh invocation in this test sees the
+# stub instead of any real claude binary that may also be on PATH. This
+# keeps `verify`'s new Accounts section deterministic: the real binary run
+# against a profile dir it has never launched creates .claude.json and
+# backups/ there as a side effect (see claude-profiles.sh profile_auth()),
+# which would corrupt the "launched but no .claude.json" scenario below.
+PATH="$T/bin:$PATH"
 out=$(PATH="$T/bin:$PATH" bash -c ". $HOME/.claude-profiles.sh; claude-work --resume x")
 check "claude-work sets CLAUDE_CONFIG_DIR and passes args" "[ \"$out\" = 'CFG=$HOME/.claude-work ARGS=--resume x' ]"
 out=$(PATH="$T/bin:$PATH" CLAUDE_CONFIG_DIR=/elsewhere bash -c ". $HOME/.claude-profiles.sh; claude mcp list")
@@ -128,6 +148,33 @@ check "verify flags symlinked credentials" "[ $rc -ne 0 ] && grep -q 'SYMLINK' $
 rm "$HOME/.claude-work/.credentials.json"; cp "$C/.credentials.json" "$HOME/.claude-work/.credentials.json"
 bash "$SCRIPT" verify > "$T/verify5.out" 2>&1; rc=$?
 check "verify clean after fixes" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify5.out"
+
+echo "=== verify: Accounts section ==="
+# At this point: work has a real copy of the source's (FAKE, not FAKE-WORK)
+# credentials, so the stub reports it logged in as me@example.com/Personal.
+# personal has no .credentials.json at all yet, so the stub reports it
+# logged out. Neither is a "problem" on its own.
+PATH="$T/bin:$PATH" bash "$SCRIPT" verify > "$T/verify-acc1.out" 2>&1; rc=$?
+check "accounts: single logged-in profile is not a problem" "[ $rc -eq 0 ]"
+check "accounts: launched profile with copied source creds shows its email" "grep -q 'work: me@example.com (Personal, max)' $T/verify-acc1.out"
+check "accounts: profile with no credentials yet reports not logged in" "grep -q 'personal: not logged in' $T/verify-acc1.out"
+
+printf '{"claudeAiOauth":{"accessToken":"FAKE-WORK"}}\n' > "$HOME/.claude-personal/.credentials.json"
+chmod 600 "$HOME/.claude-personal/.credentials.json"
+PATH="$T/bin:$PATH" bash "$SCRIPT" verify > "$T/verify-acc2.out" 2>&1; rc=$?
+check "accounts: two different accounts, exits 0" "[ $rc -eq 0 ]"
+check "accounts: work email shown" "grep -q 'work: me@example.com (Personal, max)' $T/verify-acc2.out"
+check "accounts: personal email shown" "grep -q 'personal: work@example.com (Work Org, team)' $T/verify-acc2.out"
+
+cp "$HOME/.claude-work/.credentials.json" "$HOME/.claude-personal/.credentials.json"
+PATH="$T/bin:$PATH" bash "$SCRIPT" verify > "$T/verify-acc3.out" 2>&1; rc=$?
+check "accounts: same account in both profiles is flagged, exits non-zero" "[ $rc -ne 0 ] && grep -qi 'same account' $T/verify-acc3.out"
+
+# Restore personal to its own distinct fake identity so it again differs
+# from work's, keeping the rest of this suite (which expects clean verify
+# runs below) unaffected by this deliberately-broken scenario.
+printf '{"claudeAiOauth":{"accessToken":"FAKE-WORK"}}\n' > "$HOME/.claude-personal/.credentials.json"
+chmod 600 "$HOME/.claude-personal/.credentials.json"
 
 echo "=== Claude Code version tracking ==="
 CONF="$HOME/.claude-shared/.claude-profiles.conf"
@@ -171,6 +218,12 @@ check "safe: projects NOT linked" "[ ! -e $HOME/.claude-corp/projects ] && [ ! -
 check "safe: history linked" "[ -L $HOME/.claude-corp/history.jsonl ]"
 bash "$SCRIPT" verify > "$T/verify-safe.out" 2>&1; rc=$?
 check "verify w/o flags picks up safe+names from conf" "grep -q 'main=corp second=home share=safe' $T/verify-safe.out && ! grep -q 'projects is missing' $T/verify-safe.out"
+# 'home' never inherited a login and has never been launched: the Accounts
+# section must skip it rather than run `claude auth status`, which would
+# create a .claude.json there as a side effect (see profile_auth() in
+# claude-profiles.sh).
+check "accounts: skips a not-yet-launched profile" "grep -q 'home: not launched yet, skipping' $T/verify-safe.out"
+check "accounts: skip guard creates no .claude.json for it" "[ ! -e $HOME/.claude-home/.claude.json ]"
 bash "$SCRIPT" rollback --yes > /dev/null 2>&1
 check "rollback w/o flags removed custom-named dirs" "[ ! -e $HOME/.claude-corp ] && [ ! -e $HOME/.claude-home ]"
 

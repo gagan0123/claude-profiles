@@ -121,6 +121,10 @@ reference this section still flags means that script did not exist under
 `~/.claude` at apply time (or was added since). Tell the user to re-run
 `apply` (safe to repeat) or repoint the setting by hand.
 
+Quote the "Accounts" section back to the user: it names which email each
+launched profile is actually logged in as, which is the only real proof the
+two profiles hold different accounts.
+
 **Step 7. Prove the sharing works.** In a project directory the user has used
 before, have them run `claude-work`, send one message, quit, then run
 `claude-personal --resume` in the same directory. The session from the work

@@ -772,6 +772,47 @@ json_num() {
   [ -n "$v" ] && printf '%s' "$v" || printf '%s' "unset"
 }
 
+json_str() {
+  # $1 = key. Reads JSON text from STDIN. Crude but dependency-free, same
+  # spirit as json_num(): strip newlines/tabs, then a basic-regex sed
+  # capture of whatever sits between the quotes after "key":. Falls back
+  # to a bare (unquoted) token up to the next comma or closing brace, for
+  # a value like loggedIn's true/false that is not itself quoted. Not a
+  # real JSON parser: no escaped quotes, no nested objects. Prints "unset"
+  # when the key is absent. Reads stdin into a variable once because the
+  # fallback needs a second pass over the same text.
+  local key="$1" content v
+  content=$(tr -d '\n\t')
+  v=$(printf '%s' "$content" | sed -n "s/.*\"$key\": *\"\([^\"]*\)\".*/\1/p")
+  if [ -z "$v" ]; then
+    v=$(printf '%s' "$content" | sed -n "s/.*\"$key\": *\([^,}]*\)[,}].*/\1/p")
+  fi
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "unset"
+}
+
+profile_auth() {
+  # $1 = profile dir. Prints one line: loggedIn<TAB>email<TAB>orgName<TAB>
+  # subscriptionType, read from `claude auth status --json` run against
+  # that profile's CLAUDE_CONFIG_DIR. Prints "no-binary" instead if the
+  # claude binary is not on PATH. Caller (do_verify) is responsible for
+  # only calling this when profile_launched() is already true: running
+  # auth status against a never-launched config dir creates .claude.json
+  # and backups/ inside it, which would be a verify-time write.
+  local dir="$1" out=""
+  if ! command -v claude >/dev/null 2>&1; then
+    printf '%s\n' "no-binary"
+    return 0
+  fi
+  # A logged-out profile exits 1; that must not trip set -e here, and we
+  # still want whatever JSON it printed on the way out.
+  out=$(CLAUDE_CONFIG_DIR="$dir" claude auth status --json 2>/dev/null) || true
+  printf '%s\t%s\t%s\t%s\n' \
+    "$(printf '%s' "$out" | json_str loggedIn)" \
+    "$(printf '%s' "$out" | json_str email)" \
+    "$(printf '%s' "$out" | json_str orgName)" \
+    "$(printf '%s' "$out" | json_str subscriptionType)"
+}
+
 refs_old_profile() {
   # Does a settings file point at absolute paths under ~/.claude ?
   [ -f "$1" ] || return 1
@@ -868,6 +909,43 @@ do_verify() {
     info "macOS Keychain entries starting 'Claude Code': ${n:-0}"
     info "(one per logged-in config dir, entries are keyed to CLAUDE_CONFIG_DIR;"
     info " ${SOURCE} may hold one as well if it was ever logged in via Keychain)"
+  fi
+
+  hdr "Accounts"
+  if ! command -v claude >/dev/null 2>&1; then
+    info "'claude' is not on PATH; skipping account checks (cannot ask which account each profile holds)."
+  else
+    local m_logged="" m_email=""
+    local s_logged="" s_email=""
+    local name line logged email org sub
+    for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+      [ -d "$dir" ] || continue
+      if [ "$dir" = "$MAIN_DIR" ]; then name="$MAIN"; else name="$SECOND"; fi
+      if ! profile_launched "$dir"; then
+        info "${name}: not launched yet, skipping (checking would create its .claude.json)"
+        continue
+      fi
+      line=$(profile_auth "$dir")
+      logged=$(printf '%s' "$line" | cut -f1)
+      email=$(printf '%s' "$line" | cut -f2)
+      org=$(printf '%s' "$line" | cut -f3)
+      sub=$(printf '%s' "$line" | cut -f4)
+      if [ "$logged" = "true" ]; then
+        ok "${name}: ${email} (${org}, ${sub})"
+      else
+        warn "${name}: not logged in"
+      fi
+      if [ "$dir" = "$MAIN_DIR" ]; then
+        m_logged="$logged"; m_email="$email"
+      else
+        s_logged="$logged"; s_email="$email"
+      fi
+    done
+    if [ "$m_logged" = "true" ] && [ "$s_logged" = "true" ] && [ "$m_email" = "$s_email" ]; then
+      warn "${MAIN} and ${SECOND} are both logged in as the same account (${m_email})."
+      warn "That defeats the purpose of two separate profiles."
+      problems=$((problems+1))
+    fi
   fi
 
   hdr "Per-profile app state (.claude.json)"
