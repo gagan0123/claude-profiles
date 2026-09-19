@@ -199,8 +199,9 @@ Options:
   --second NAME     name of the second profile (default: ${SECOND})
   --share MODE      full | safe   (default: ${SHARE_MODE})
                       full = share transcripts, history, checkpoints, skills
-                      safe = share history/plans/skills only, transcripts stay
-                             per-profile. Read README.md before choosing.
+                      safe = share plans/skills only, transcripts stay
+                             per-profile. history.jsonl (every prompt you
+                             typed) is still shared either way. See README.md.
   --source DIR      profile to seed from (default: ${SOURCE})
   --shell           append the launcher functions to your shell rc file
                     (without this, the snippet is written out for you to add)
