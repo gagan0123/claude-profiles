@@ -12,6 +12,8 @@ Contents of this bundle:
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
 | `ROLLBACK.md` | How to undo, at three levels of severity. |
+| `tests/e2e.sh` | End-to-end test against a throwaway fake home. Never touches the real `~/.claude`. |
+| `AGENTS.md` | For anyone changing the script: invariants, portability rules, how to test. |
 
 macOS and Linux only. See [Windows](#windows) below.
 
@@ -32,8 +34,10 @@ shared location.
 ~/.claude              your existing setup. NEVER MODIFIED. Still works.
 
 ~/.claude-work         profile 1
-  .credentials.json      real file, its own login
-  .claude.json           real file, its own OAuth state and project trust
+  .credentials.json      real file, copied from ~/.claude (Linux) so it is
+                         already logged in; on macOS the Keychain holds it
+  .claude.json           real file, copied from ~/.claude.json: onboarding
+                         done, project trust, user-scope MCP servers
   settings.json          real file, copied from ~/.claude at setup
   CLAUDE.md              real file, copied from ~/.claude at setup
   projects   ──┐         symlink
@@ -42,19 +46,24 @@ shared location.
   ...          │
                │
 ~/.claude-personal      profile 2
-  .credentials.json      real file, its own login
-  .claude.json           real file, its own OAuth state and project trust
+  .credentials.json      real file, written by its own browser login
+  .claude.json           real file, created on first launch, own trust map
   projects   ──┤         symlink
   history.jsonl┤         symlink
   skills       ┤         symlink
   ...          │
                │
 ~/.claude-shared ◄──────┘  the single real copy of everything shared
+  .claude-profiles.conf    records the names and sharing mode you chose, so
+                           verify and rollback do not need the flags again
 ```
 
 Launch with `claude-work` or `claude-personal`. Bare `claude` is deliberately
 shadowed with an error, so you cannot drift back onto the old profile by
-muscle memory.
+muscle memory. The shadow steps aside when `CLAUDE_CONFIG_DIR` is already
+set, which is what makes `claude --version`, `claude mcp add` and friends
+keep working *inside* a session started with `claude-work` (the session's
+shell inherits the variable).
 
 ---
 
@@ -68,7 +77,10 @@ account. The script is built around avoiding that:
    delete the three new directories and your original profile is exactly as
    it was.
 2. **A tar backup of `~/.claude` and `~/.claude.json` is taken first**, into
-   `~/.claude-backups/`, before anything is created.
+   `~/.claude-backups/`, before anything is created. The archive is read back
+   before the script continues; if tar fails outright, nothing else happens.
+   The directory is mode 700 and the archive mode 600, because the archive
+   contains your credentials.
 3. **You never run `/logout`.** The main profile gets a copy of the existing
    credentials so it is already signed in. Only the second, empty profile
    does a browser login. This matters: current Claude Code versions can
@@ -78,12 +90,23 @@ account. The script is built around avoiding that:
    changes nothing. Run it first, read it, then run `apply`.
 5. **`apply` refuses to clobber.** If a path where a symlink should go already
    holds real data, it warns and skips rather than deleting.
-6. **`apply` is idempotent.** Running it twice is safe.
+6. **`apply` is idempotent.** Running it twice is safe. Each shared path is
+   copied under a temporary name and renamed only when the copy completes, so
+   an interrupted run (Ctrl-C, disk full) leaves nothing that a second run
+   would mistake for finished data. Pass `--no-backup` on a re-run if you do
+   not want a second archive.
+7. **Confirmation prompts fail closed.** `apply` and `rollback` ask before
+   doing anything. When there is no terminal to answer (inside Claude Code's
+   Bash tool, CI, an editor task) they stop and tell you to pass `--yes`.
+   Nothing is half-done.
+8. **Preflight checks free disk space** against the size of the copy plus the
+   backup, and `apply` refuses to start if it cannot fit.
 
 Cost of this approach: the shared data is a *copy*, so transcripts are on disk
-twice until you delete `~/.claude`. Check `du -sh ~/.claude` first. Once
-you have used the new setup for a week and are happy, delete the old
-directory and reclaim the space.
+twice until you delete `~/.claude`. `plan` prints the sizes. Once you have
+used the new setup for a week and are happy, delete the old directory and
+reclaim the space, after checking the "settings that still point at
+~/.claude" section of `verify` (see below).
 
 ---
 
@@ -112,8 +135,14 @@ Useful options:
 --share safe     do NOT share transcripts, see below
 --source DIR     seed from a profile other than ~/.claude
 --shell          append the source line to your .zshrc / .bashrc for you
---yes            skip confirmations
+--no-backup      skip the tar archive (only sensible on a re-run of apply)
+--yes            skip confirmations; required when no terminal can answer them
 ```
+
+`--main`, `--second`, `--share` and `--source` are remembered in
+`~/.claude-shared/.claude-profiles.conf` after `apply`, so `verify` and
+`rollback` use the same values without you repeating them. Explicit flags
+always win.
 
 ---
 
@@ -129,7 +158,8 @@ default.
 | `projects/` | Transcripts and auto-memory. This is what makes `--resume` and `--continue` work across both accounts. |
 | `file-history/` | Checkpoint restore works across both. |
 | `history.jsonl` | Up-arrow prompt recall is one list. |
-| `plans/`, `tasks/`, `paste-cache/`, `image-cache/`, `session-env/` | A resumed session has its todos, pasted text and images intact. |
+| `plans/`, `tasks/`, `paste-cache/`, `image-cache/`, `uploads/`, `session-env/` | A resumed session has its task list, pasted text, images and attachments intact. |
+| `agent-memory/` | Subagents declared with `memory: user` keep one memory across both accounts. |
 | `skills/`, `commands/`, `agents/`, `workflows/`, `rules/`, `output-styles/`, `plugins/` | Configure once, works in both. |
 
 **`--share safe`** shares only `history.jsonl`, `plans/`, `paste-cache/` and
@@ -157,23 +187,52 @@ storage").
 | Path | Why not |
 |---|---|
 | `.credentials.json` | This is the entire point of the separation. If `verify` ever reports this as a symlink, the setup is broken. |
-| `.claude.json` | Holds the OAuth session, per-project trust decisions, and user-scope MCP servers. Sharing it would share the login. |
+| `.claude.json` | Holds the OAuth session, per-project trust decisions, and user-scope MCP servers. Sharing it would share the login. The main profile gets a *copy* of `~/.claude.json` so it inherits trust decisions and MCP servers; the second profile starts empty. |
 | `sessions/` | One file per running session, used for live-session detection and crash cleanup. Sharing it lets one profile clean up the other's running session. |
+| `backups/` | Rolling copies of that profile's own `.claude.json`. Meaningless if shared. |
 | `settings.json`, `CLAUDE.md` | Copied once into each profile, then free to diverge. Your work profile may have org-specific permissions or env you do not want in personal. |
+
+`verify` checks that `.credentials.json`, `.claude.json` and `sessions/` are
+real files or directories in each profile, never symlinks, and that nothing
+inside `~/.claude` points at the new directories.
 
 ---
 
 ## Things that will surprise you
 
-**Trust prompts appear twice.** Per-project trust lives in `.claude.json`,
-which is per profile. The first time you open a given project in the second
-profile you get the trust dialog again, even though the transcripts are
-already sitting there. Answer it once per profile per project.
+**Trust prompts appear again in the second profile.** Per-project trust lives
+in `.claude.json`, which is per profile. The main profile inherits a copy of
+yours, so it behaves as before. The first time you open a given project in
+the second profile you get the trust dialog again, even though the
+transcripts are already sitting there. Answer it once per project.
 
-**User-scope MCP servers do not carry over.** They also live in
-`.claude.json`. Add them again in the second profile with
-`claude mcp add --scope user`, or move the ones you can into a project-level
-`.mcp.json` at the repo root, which both profiles read.
+**User-scope MCP servers do not carry over to the second profile.** They also
+live in `.claude.json`. Add them again there with
+`claude-personal mcp add --scope user`, or move the ones you can into a
+project-level `.mcp.json` at the repo root, which both profiles read.
+
+**Settings that point back at `~/.claude` by absolute path.** A `statusLine`
+command such as `~/.claude/statusline.sh`, or a hook script kept under
+`~/.claude/hooks/`, is copied into both profiles' `settings.json` *still
+pointing at `~/.claude`*. That works as long as `~/.claude` exists, and
+breaks the day you delete it to reclaim space. `verify` warns when it sees
+such a reference. Move the script into the shared directory and repoint the
+setting, or just keep `~/.claude`.
+
+**IDE extensions do not know about profiles.** The VS Code and JetBrains
+extensions launch and discover Claude Code without your shell functions, so
+they use `~/.claude` (the old profile) unless `CLAUDE_CONFIG_DIR` is set in
+the IDE's own environment. If you rely on `/ide` or the extension's launcher,
+set that variable where the IDE reads it (for example the extension's
+environment settings, or by launching the IDE from a terminal where it is
+exported) and accept that one IDE window is tied to one profile.
+
+**Re-run `verify` after Claude Code upgrades.** Everything here rests on
+Claude Code following symlinks in its config dir and on `CLAUDE_CONFIG_DIR`
+keeping `.claude.json` and credentials per directory. Both are documented
+today (see references), but a future version that rewrites `history.jsonl`
+through a temp file and rename would silently replace the link with a real
+file. `verify` catches exactly that, so run it after an upgrade.
 
 **`cleanupPeriodDays` must match in both profiles.** The retention sweep runs
 per profile but operates on the same shared `projects/` directory. If work is
@@ -187,24 +246,35 @@ sessions in the same project directory are fine. The same `.jsonl` open in two
 processes means two writers appending to one file, and you will corrupt it.
 Nothing warns you.
 
-**On macOS, credentials live in the Keychain, not in a file.** The main
-profile may still prompt for a browser login on first launch even though the
-script copied everything it could. That is fine. Log in with the *same*
-account. It is a login, not a logout, and revokes nothing.
+**On macOS, credentials live in the Keychain, not in a file.** The Keychain
+entry is keyed to the config directory (the authentication docs: "keys the
+macOS Keychain entry to that directory too, so a session with a different
+`CLAUDE_CONFIG_DIR` reads a different entry"). So the main profile *will*
+prompt for a browser login on first launch, because there is no entry for
+`~/.claude-work` yet. That is fine. Log in with the *same* account. It is a
+login, not a logout, and revokes nothing. The exception is a Mac where the
+Keychain was locked at login time (typical over SSH): Claude Code then falls
+back to `.credentials.json` in the config dir, the script copies that file,
+and no prompt appears. `verify` prints how many `Claude Code` Keychain
+entries exist so you can see that each profile got its own.
 
 ---
 
 ## If verify flags `.claude.json`
 
 `verify` checks that each profile has its own `.claude.json` *after* you have
-launched it once. If a profile has been launched and still has no
+launched it once. The main profile gets a copy at setup, so the check that
+matters is on the second profile: if it has been launched and still has no
 `.claude.json` inside it, your Claude Code version is keeping that state at
 `~/.claude.json` instead, outside the config directory. Both profiles then
 share OAuth state and the isolation does not hold.
 
-This is the known failure mode on Windows and it is worth confirming rather
-than assuming on any platform, because the behaviour has changed between
-versions and `CLAUDE_CONFIG_DIR` is still not formally documented (see
+The docs for the `.claude` directory say that with `CLAUDE_CONFIG_DIR` set,
+"every `~/.claude` path on this page lives under that directory instead",
+and `.claude.json` is on that page, so on current versions this should not
+happen on macOS or Linux. It is the known failure mode on Windows and it is
+worth confirming rather than assuming, because the behaviour has changed
+between versions (see
 [anthropics/claude-code#33430](https://github.com/anthropics/claude-code/issues/33430)).
 
 If you hit it, stop before logging the second account in, and fall back to
@@ -246,5 +316,6 @@ former.
 
 - [Explore the .claude directory](https://code.claude.com/docs/en/claude-directory) — authoritative list of what every path holds, retention behaviour, plaintext storage warning
 - [Environment variables](https://code.claude.com/docs/en/env-vars)
-- [Authentication](https://code.claude.com/docs/en/authentication)
+- [Authentication, "Credential management"](https://code.claude.com/docs/en/authentication#credential-management) — per-platform credential storage, and the statement that `CLAUDE_CONFIG_DIR` keys both the credentials file and the macOS Keychain entry
+- [Retention (`cleanupPeriodDays`)](https://code.claude.com/docs/en/claude-directory) — which paths the age sweep deletes; note it covers `plans/` and `paste-cache/`, which are shared in both modes
 - [Issue #33430](https://github.com/anthropics/claude-code/issues/33430) — `CLAUDE_CONFIG_DIR` is undocumented; track it for changes

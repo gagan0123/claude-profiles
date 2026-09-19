@@ -20,10 +20,18 @@
 #
 # Requires bash 3.2+ (works with macOS's stock /bin/bash). macOS + Linux.
 # NOT supported on Windows: see README.md "Windows" for why.
+#
+# Portability notes, so nobody "fixes" these into something that only works
+# on one platform:
+#   - readlink is used WITHOUT -f (macOS readlink lacks it before 12.3)
+#   - du -sk / df -Pk / tar czf / cp -Rp / grep -F / sed -n are the POSIX
+#     subset that GNU and BSD userlands agree on
+#   - no arrays, no [[ ]], no ${var,,}, no mapfile: bash 3.2 has none of them
+#   - tar takes several -C flags positionally in both GNU tar and bsdtar
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ---------------------------------------------------------------- defaults --
 
@@ -34,13 +42,21 @@ SHARED="${HOME}/.claude-shared"
 BACKUP_ROOT="${HOME}/.claude-backups"
 SHARE_MODE="full"
 DO_SHELL=0
+DO_BACKUP=1
 ASSUME_YES=0
 CMD=""
+
+# Which options were given explicitly on the command line. Anything not given
+# explicitly falls back to the values recorded at apply time (see CONF_FILE),
+# so `verify` and `rollback` do not need the flags repeated.
+MAIN_SET=0; SECOND_SET=0; SHARE_SET=0; SOURCE_SET=0
+CONF_LOADED=0
 
 # Session data. "full" gives you cross-profile --resume and --continue.
 # "safe" deliberately leaves transcripts and checkpoints per-profile so that
 # one account's conversations never become readable under the other.
-DATA_FULL="projects history.jsonl file-history plans tasks paste-cache image-cache session-env"
+# Path list source of truth: https://code.claude.com/docs/en/claude-directory
+DATA_FULL="projects history.jsonl file-history plans tasks paste-cache image-cache uploads session-env agent-memory"
 DATA_SAFE="history.jsonl plans paste-cache"
 
 # Personal config worth having identical in both profiles.
@@ -53,6 +69,8 @@ CONFIG_COPIED="settings.json CLAUDE.md keybindings.json themes"
 #   .credentials.json  the whole point of the separation
 #   .claude.json       holds the OAuth session and per-project trust
 #   sessions/          live-session detection; sharing invites cross-cleanup
+#   backups/           rolling copies of .claude.json, per profile by nature
+PRIVATE=".credentials.json .claude.json sessions"
 
 # ------------------------------------------------------------------- utils --
 
@@ -78,11 +96,68 @@ run() {
   fi
 }
 
+have_tty() {
+  # True only if /dev/tty can actually be opened. Inside Claude Code's Bash
+  # tool, CI, and most editors' task runners it cannot, and `read </dev/tty`
+  # fails with "No such device or address".
+  ( exec </dev/tty ) 2>/dev/null
+}
+
 confirm() {
   [ "$ASSUME_YES" -eq 1 ] && return 0
+  if ! have_tty; then
+    say ""
+    warn "No terminal is available to answer: $1"
+    warn "Re-run with --yes to skip confirmations. (This is expected when the"
+    warn "script is driven from inside Claude Code or any non-interactive runner.)"
+    return 1
+  fi
   printf '\n%s ' "$1 [y/N]"
   read -r reply </dev/tty || reply=""
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+kb_h() {
+  # kilobytes -> human readable, portable awk only
+  awk -v k="${1:-0}" 'BEGIN {
+    if (k >= 1048576) printf "%.1fG", k/1048576;
+    else if (k >= 1024) printf "%.0fM", k/1024;
+    else printf "%dK", k }'
+}
+
+dir_kb() {
+  # size of a path in KB, 0 if unreadable/missing
+  local s
+  s=$(du -sk "$1" 2>/dev/null | cut -f1) || s=0
+  printf '%s' "${s:-0}"
+}
+
+same_path() {
+  # True if two paths name the same directory (physical compare when both
+  # exist, string compare otherwise).
+  local a="$1" b="$2" pa pb
+  [ "$a" = "$b" ] && return 0
+  [ -d "$a" ] && [ -d "$b" ] || return 1
+  pa=$(cd "$a" 2>/dev/null && pwd -P) || return 1
+  pb=$(cd "$b" 2>/dev/null && pwd -P) || return 1
+  [ "$pa" = "$pb" ]
+}
+
+valid_name() {
+  case "$1" in
+    "") return 1 ;;
+    *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
+rc_file() {
+  case "${SHELL##*/}" in
+    zsh)  printf '%s' "${HOME}/.zshrc" ;;
+    bash) if [ "$OS" = "macos" ]; then printf '%s' "${HOME}/.bash_profile"
+          else printf '%s' "${HOME}/.bashrc"; fi ;;
+    *)    printf '' ;;
+  esac
 }
 
 usage() {
@@ -108,8 +183,14 @@ Options:
   --source DIR      profile to seed from (default: ${SOURCE})
   --shell           append the launcher functions to your shell rc file
                     (without this, the snippet is written out for you to add)
-  --yes             skip confirmation prompts
+  --no-backup       skip the tar backup (only sensible on a re-run of apply)
+  --yes             skip confirmation prompts. REQUIRED when there is no
+                    terminal to answer them, e.g. when run from Claude Code.
   -h, --help        this text
+
+After a successful apply, --main/--second/--share/--source are remembered in
+~/.claude-shared/.claude-profiles.conf, so verify and rollback do not need
+them repeated. Explicit flags always win over the remembered values.
 
 Examples:
   ./claude-profiles.sh plan
@@ -130,16 +211,37 @@ esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --main)   MAIN="${2:?--main needs a name}"; shift 2 ;;
-    --second) SECOND="${2:?--second needs a name}"; shift 2 ;;
-    --share)  SHARE_MODE="${2:?--share needs full or safe}"; shift 2 ;;
-    --source) SOURCE="${2:?--source needs a path}"; shift 2 ;;
+    --main)   MAIN="${2:?--main needs a name}";   MAIN_SET=1;   shift 2 ;;
+    --second) SECOND="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
+    --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
+    --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
     --shell)  DO_SHELL=1; shift ;;
+    --no-backup) DO_BACKUP=0; shift ;;
     --yes)    ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option '${1}'. Try --help." ;;
   esac
 done
+
+case "$(uname -s)" in
+  Darwin) OS="macos" ;;
+  Linux)  OS="linux" ;;
+  *) die "unsupported OS '$(uname -s)'. See README.md, section Windows." ;;
+esac
+
+# Remembered settings from a previous apply. Explicit flags override.
+CONF_FILE="${SHARED}/.claude-profiles.conf"
+if [ -f "$CONF_FILE" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      MAIN)       if [ "$MAIN_SET"   -eq 0 ]; then MAIN="$v";       fi ;;
+      SECOND)     if [ "$SECOND_SET" -eq 0 ]; then SECOND="$v";     fi ;;
+      SHARE_MODE) if [ "$SHARE_SET"  -eq 0 ]; then SHARE_MODE="$v"; fi ;;
+      SOURCE)     if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
+    esac
+  done < "$CONF_FILE"
+  CONF_LOADED=1
+fi
 
 case "$SHARE_MODE" in
   full) SHARE_DATA="$DATA_FULL" ;;
@@ -147,17 +249,32 @@ case "$SHARE_MODE" in
   *) die "--share must be 'full' or 'safe', got '${SHARE_MODE}'" ;;
 esac
 
+valid_name "$MAIN"   || die "--main must be letters, digits, '_' or '-', got '${MAIN}'"
+valid_name "$SECOND" || die "--second must be letters, digits, '_' or '-', got '${SECOND}'"
 [ "$MAIN" = "$SECOND" ] && die "--main and --second must differ"
 
+SOURCE="${SOURCE%/}"
 MAIN_DIR="${HOME}/.claude-${MAIN}"
 SECOND_DIR="${HOME}/.claude-${SECOND}"
 SHARE_ALL="${SHARE_DATA} ${CONFIG_SHARED}"
 
-case "$(uname -s)" in
-  Darwin) OS="macos" ;;
-  Linux)  OS="linux" ;;
-  *) die "unsupported OS '$(uname -s)'. See README.md, section Windows." ;;
-esac
+for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+  if same_path "$SOURCE" "$d"; then
+    die "source '${SOURCE}' is one of the directories this script manages. Refusing."
+  fi
+done
+
+# The app-state file that belongs to SOURCE. With CLAUDE_CONFIG_DIR unset,
+# Claude Code keeps it at ~/.claude.json, next to (not inside) ~/.claude.
+# With CLAUDE_CONFIG_DIR set, it lives inside the config dir.
+SRC_STATE=""
+if [ -f "${SOURCE}/.claude.json" ]; then
+  SRC_STATE="${SOURCE}/.claude.json"
+elif same_path "$SOURCE" "${HOME}/.claude" && [ -f "${HOME}/.claude.json" ]; then
+  SRC_STATE="${HOME}/.claude.json"
+fi
+
+SNIPPET_FILE="${HOME}/.claude-profiles.sh"
 
 # ---------------------------------------------------------------- preflight --
 
@@ -168,6 +285,18 @@ preflight() {
        If you have never run Claude Code, run it once and log in first."
   ok "source profile found: ${SOURCE}"
 
+  if [ ! -e "${SOURCE}/settings.json" ] && [ ! -e "${SOURCE}/projects" ] \
+     && [ ! -e "${SOURCE}/.credentials.json" ]; then
+    warn "'${SOURCE}' has none of settings.json, projects/, .credentials.json."
+    warn "Is it really a Claude Code config directory?"
+  fi
+
+  if [ -n "$SRC_STATE" ]; then
+    ok "app state found: ${SRC_STATE}"
+  else
+    info "no .claude.json found for the source profile (fresh install?)"
+  fi
+
   if command -v claude >/dev/null 2>&1; then
     ok "claude binary: $(command -v claude)"
   else
@@ -177,8 +306,14 @@ preflight() {
 
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     warn "CLAUDE_CONFIG_DIR is already set to '${CLAUDE_CONFIG_DIR}'."
-    warn "Unset it or make sure it is not exported from your shell rc,"
-    warn "or it will override the launcher functions this script writes."
+    warn "If it is exported from your shell rc it will override the launcher"
+    warn "functions this script writes. (Being set because you are running this"
+    warn "from inside a claude-<profile> session is fine.)"
+  fi
+
+  if [ "$ASSUME_YES" -eq 0 ] && ! have_tty; then
+    warn "no terminal available for confirmation prompts. 'apply' and"
+    warn "'rollback' will stop at their prompt unless you pass --yes."
   fi
 
   local d
@@ -190,38 +325,88 @@ preflight() {
   done
 
   if [ "$OS" = "macos" ]; then
-    info "macOS: credentials live in the Keychain, not in the profile dir."
-    info "The '${MAIN}' profile may still prompt for a browser login on first"
+    info "macOS: credentials live in the Keychain, keyed to the config dir."
+    info "The '${MAIN}' profile will prompt for a browser login on first"
     info "launch. That is fine. Log in with the SAME account. Never /logout."
   fi
 
-  local sz
-  sz=$(du -sh "$SOURCE" 2>/dev/null | cut -f1 || echo "?")
-  info "source profile size: ${sz} (a copy of the data is made, not a move)"
+  # Disk space: the shared data is copied, and the backup is a compressed
+  # copy of the whole source. Budget for the worst case of both.
+  local p need=0 src_kb have total
+  for p in $SHARE_ALL; do
+    [ -e "${SOURCE}/${p}" ] || continue
+    [ -e "${SHARED}/${p}" ] && continue
+    need=$((need + $(dir_kb "${SOURCE}/${p}")))
+  done
+  src_kb=$(dir_kb "$SOURCE")
+  total=$need
+  [ "$DO_BACKUP" -eq 1 ] && total=$((total + src_kb))
+  have=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
+  info "source profile size: $(kb_h "$src_kb")"
+  info "disk: copy needs ~$(kb_h "$need"), backup up to $(kb_h "$src_kb"), free $(kb_h "$have")"
+  if [ "${have:-0}" -lt "$total" ]; then
+    warn "not enough free space for the copy plus the backup."
+    if [ "$CMD" = "apply" ]; then
+      die "free up space, or move the backup elsewhere, then re-run."
+    fi
+  fi
 }
 
 # ------------------------------------------------------------------ backup --
 
 do_backup() {
-  local stamp archive
+  hdr "Backup"
+  if [ "$DO_BACKUP" -eq 0 ]; then
+    info "skipped (--no-backup)"
+    return 0
+  fi
+
+  local stamp archive parent base st
   stamp="$(date +%Y%m%d-%H%M%S)"
   archive="${BACKUP_ROOT}/claude-${stamp}.tar.gz"
+  parent=$(dirname "$SOURCE")
+  base=$(basename "$SOURCE")
 
-  hdr "Backup"
-  info "archive: ${archive}"
+  info "archive:  ${archive}"
+  info "contents: ${SOURCE}${SRC_STATE:+ and ${SRC_STATE}}"
+  info "mode 600, in a mode 700 directory: the archive contains credentials"
 
-  run mkdir -p "$BACKUP_ROOT"
   if [ "$DRY" -eq 1 ]; then
-    printf '%s\n' "  ${C_DIM}would run:${C_OFF} tar czf ${archive} ~/.claude ~/.claude.json"
-  else
-    tar czf "$archive" \
-      -C "$HOME" \
-      $( [ -d "${HOME}/.claude" ] && echo ".claude" ) \
-      $( [ -f "${HOME}/.claude.json" ] && echo ".claude.json" ) \
-      2>/dev/null || warn "tar reported errors (often harmless: sockets, live files)"
-    [ -f "$archive" ] && ok "backup written ($(du -sh "$archive" | cut -f1))"
-    printf '%s\n' "$archive" > "${BACKUP_ROOT}/.latest"
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} mkdir -p ${BACKUP_ROOT} && chmod 700 ${BACKUP_ROOT}"
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} (umask 077; tar czf ${archive} -C ${parent} ${base}${SRC_STATE:+ -C $(dirname "$SRC_STATE") $(basename "$SRC_STATE")})"
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} tar tzf ${archive} >/dev/null   # read-back check"
+    return 0
   fi
+
+  mkdir -p "$BACKUP_ROOT"
+  chmod 700 "$BACKUP_ROOT"
+
+  st=0
+  (
+    umask 077
+    if [ -n "$SRC_STATE" ]; then
+      tar czf "$archive" -C "$parent" "$base" \
+        -C "$(dirname "$SRC_STATE")" "$(basename "$SRC_STATE")"
+    else
+      tar czf "$archive" -C "$parent" "$base"
+    fi
+  ) 2>"${archive}.log" || st=$?
+
+  if [ "$st" -ne 0 ]; then
+    if [ "$st" -eq 1 ] && [ -s "$archive" ]; then
+      warn "tar exit 1: some files changed or were unreadable while archiving."
+      warn "Usual cause: a Claude Code session is running. Details: ${archive}.log"
+    else
+      die "backup FAILED (tar exit ${st}). See ${archive}.log. Nothing else was changed."
+    fi
+  fi
+
+  tar tzf "$archive" >/dev/null 2>&1 \
+    || die "backup archive does not read back cleanly: ${archive}. Not continuing."
+
+  [ -s "${archive}.log" ] || rm -f "${archive}.log"
+  ok "backup written and read back ($(du -sh "$archive" | cut -f1))"
+  printf '%s\n' "$archive" > "${BACKUP_ROOT}/.latest"
 }
 
 # ------------------------------------------------------------------ shared --
@@ -230,16 +415,26 @@ seed_shared() {
   hdr "Shared directory: ${SHARED}"
   run mkdir -p "$SHARED"
 
-  local p src
+  local p src tmp
   for p in $SHARE_ALL; do
     src="${SOURCE}/${p}"
+    tmp="${SHARED}/.${p}.partial"
     if [ -e "${SHARED}/${p}" ]; then
       info "keep   ${p} (already in shared dir, left alone)"
       continue
     fi
+    if [ -e "$tmp" ]; then
+      info "clean  ${p} (stale partial copy from an interrupted run)"
+      run rm -rf "$tmp"
+    fi
     if [ -e "$src" ]; then
+      # Copy to a temp name and rename on completion, so an interrupted
+      # copy never masquerades as a finished one on the next run.
+      # -p keeps mtimes: Claude Code orders --resume and runs the
+      # retention sweep by file age.
       info "seed   ${p} <- ${src}"
-      run cp -R "$src" "${SHARED}/${p}"
+      run cp -Rp "$src" "$tmp"
+      run mv "$tmp" "${SHARED}/${p}"
     else
       case "$p" in
         *.jsonl) info "create ${p} (empty, source had none)"
@@ -251,10 +446,25 @@ seed_shared() {
   done
 }
 
+write_conf() {
+  if [ "$DRY" -eq 1 ]; then
+    info "would record MAIN/SECOND/SHARE_MODE/SOURCE in ${CONF_FILE}"
+    return 0
+  fi
+  {
+    printf 'VERSION=%s\n'    "$VERSION"
+    printf 'MAIN=%s\n'       "$MAIN"
+    printf 'SECOND=%s\n'     "$SECOND"
+    printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
+    printf 'SOURCE=%s\n'     "$SOURCE"
+  } > "$CONF_FILE"
+  ok "recorded settings in ${CONF_FILE}"
+}
+
 # ---------------------------------------------------------------- profiles --
 
 make_profile() {
-  local dir="$1" label="$2" want_creds="$3"
+  local dir="$1" label="$2" inherit="$3"
 
   hdr "Profile: ${dir}"
   run mkdir -p "$dir"
@@ -266,23 +476,33 @@ make_profile() {
       info "keep   ${p} (already present)"
     elif [ -e "$src" ]; then
       info "copy   ${p}"
-      run cp -R "$src" "${dir}/${p}"
+      run cp -Rp "$src" "${dir}/${p}"
     fi
   done
 
-  if [ "$want_creds" = "yes" ] && [ -f "${SOURCE}/.credentials.json" ]; then
+  if [ "$inherit" = "yes" ]; then
     if [ -f "${dir}/.credentials.json" ]; then
       info "keep   .credentials.json (already present)"
-    else
+    elif [ -f "${SOURCE}/.credentials.json" ]; then
       info "copy   .credentials.json  (so '${label}' stays logged in as your"
       info "       current account and you never have to run /logout)"
       run cp -p "${SOURCE}/.credentials.json" "${dir}/.credentials.json"
       run chmod 600 "${dir}/.credentials.json"
+    else
+      info "no .credentials.json in source (expected on macOS: Keychain)"
     fi
-  elif [ "$want_creds" = "yes" ]; then
-    info "no .credentials.json in source (expected on macOS: Keychain)"
+
+    if [ -f "${dir}/.claude.json" ]; then
+      info "keep   .claude.json (already present)"
+    elif [ -n "$SRC_STATE" ]; then
+      info "copy   .claude.json <- ${SRC_STATE}"
+      info "       (onboarding state, project trust, user-scope MCP servers,"
+      info "       account info: '${label}' picks up where ${SOURCE} left off)"
+      run cp -p "$SRC_STATE" "${dir}/.claude.json"
+    fi
   else
-    info "no credentials copied: '${label}' will do a fresh browser login"
+    info "no credentials or app state copied: '${label}' starts empty and"
+    info "       will do a fresh browser login"
   fi
 
   for p in $SHARE_ALL; do
@@ -302,8 +522,6 @@ make_profile() {
 
 # ------------------------------------------------------------------- shell --
 
-SNIPPET_FILE="${HOME}/.claude-profiles.sh"
-
 write_snippet() {
   hdr "Launcher functions"
   info "file: ${SNIPPET_FILE}"
@@ -311,8 +529,9 @@ write_snippet() {
   local body
   body=$(cat <<EOF
 # ---8<--- claude-profiles v${VERSION} ---8<---
-# Generated by claude-profiles.sh. Safe to edit.
-# Each function points Claude Code at its own credentials directory.
+# Generated by claude-profiles.sh. Safe to edit. Sourced by bash and zsh.
+# Each launcher points Claude Code at its own config directory, which holds
+# that profile's credentials and app state.
 
 claude-${MAIN}() {
   CLAUDE_CONFIG_DIR="${MAIN_DIR}" command claude "\$@"
@@ -322,11 +541,20 @@ claude-${SECOND}() {
   CLAUDE_CONFIG_DIR="${SECOND_DIR}" command claude "\$@"
 }
 
-# Guard rail: bare 'claude' would use ~/.claude, which is your untouched
-# pre-migration profile. Force an explicit choice instead.
+# Guard rail: bare 'claude' would silently use ~/.claude, the untouched
+# pre-migration profile. Force an explicit choice, EXCEPT when a profile has
+# already been chosen via CLAUDE_CONFIG_DIR. That exception is what lets
+# 'claude --version', 'claude mcp ...' and similar work inside a session
+# started with claude-${MAIN} or claude-${SECOND}, since the session's shell
+# inherits the variable.
 claude() {
+  if [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
+    command claude "\$@"
+    return
+  fi
   printf '%s\n' "Pick a profile: claude-${MAIN} or claude-${SECOND}" >&2
-  printf '%s\n' "(bare 'claude' uses ~/.claude, the old profile)" >&2
+  printf '%s\n' "(bare 'claude' would use ~/.claude, the old profile." >&2
+  printf '%s\n' " Set CLAUDE_CONFIG_DIR yourself to override this guard.)" >&2
   return 1
 }
 # ---8<--- end claude-profiles ---8<---
@@ -341,29 +569,28 @@ EOF
     ok "written"
   fi
 
-  local rc=""
-  case "${SHELL##*/}" in
-    zsh)  rc="${HOME}/.zshrc" ;;
-    bash) [ "$OS" = "macos" ] && rc="${HOME}/.bash_profile" || rc="${HOME}/.bashrc" ;;
-    *)    rc="" ;;
-  esac
-
-  local line=". \"${SNIPPET_FILE}\""
+  local rc line
+  rc=$(rc_file)
+  line=". \"${SNIPPET_FILE}\""
 
   if [ -z "$rc" ]; then
     warn "unrecognised shell '${SHELL}'. Add this line to your rc file yourself:"
     warn "  ${line}"
-    return
+    return 0
   fi
 
   if [ -f "$rc" ] && grep -qF "$SNIPPET_FILE" "$rc" 2>/dev/null; then
     ok "${rc} already sources it"
-    return
+    return 0
   fi
 
   if [ "$DO_SHELL" -eq 1 ]; then
-    info "appending source line to ${rc}"
-    run sh -c "printf '\n# claude-profiles\n%s\n' '${line}' >> '${rc}'"
+    if [ "$DRY" -eq 1 ]; then
+      printf '%s\n' "  ${C_DIM}would append to ${rc}:${C_OFF} ${line}"
+    else
+      printf '\n# claude-profiles\n%s\n' "$line" >> "$rc"
+      ok "appended source line to ${rc}"
+    fi
   else
     say ""
     say "  Add this line to ${rc} yourself, then open a new terminal:"
@@ -392,6 +619,10 @@ check_link() {
     warn "${dir}/${p} points at '${target}', expected '${want}'"
     return 1
   fi
+  if [ ! -e "${dir}/${p}" ]; then
+    warn "${dir}/${p} is a dangling link: '${want}' does not exist"
+    return 1
+  fi
   return 0
 }
 
@@ -399,7 +630,7 @@ profile_launched() {
   # Claude Code writes these on first run. If none exist, the profile has
   # never been launched and there is nothing meaningful to inspect yet.
   local dir="$1" m
-  for m in .claude.json sessions shell-snapshots stats-cache.json cache debug; do
+  for m in .claude.json sessions shell-snapshots stats-cache.json cache debug backups statsig; do
     [ -e "${dir}/${m}" ] && return 0
   done
   return 1
@@ -413,6 +644,18 @@ json_num() {
   [ -n "$v" ] && printf '%s' "$v" || printf '%s' "unset"
 }
 
+refs_old_profile() {
+  # Does a settings file point at absolute paths under ~/.claude ?
+  [ -f "$1" ] || return 1
+  # Literal patterns on purpose: we are looking for these exact spellings.
+  # shellcheck disable=SC2088,SC2016
+  grep -qF '~/.claude/' "$1" 2>/dev/null && return 0
+  # shellcheck disable=SC2016
+  grep -qF '$HOME/.claude/' "$1" 2>/dev/null && return 0
+  grep -qF "${HOME}/.claude/" "$1" 2>/dev/null && return 0
+  return 1
+}
+
 do_verify() {
   local problems=0
 
@@ -421,9 +664,28 @@ do_verify() {
   for d in "$SOURCE" "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
     if [ -d "$d" ]; then ok "$d"; else warn "missing: $d"; problems=$((problems+1)); fi
   done
+  if [ "$CONF_LOADED" -eq 1 ]; then
+    ok "settings read from ${CONF_FILE} (main=${MAIN} second=${SECOND} share=${SHARE_MODE})"
+  else
+    info "no ${CONF_FILE}; checking against defaults/flags (main=${MAIN} second=${SECOND} share=${SHARE_MODE})"
+  fi
+
+  hdr "Source profile untouched"
+  local p touched=0
+  for p in $SHARE_ALL $PRIVATE; do
+    if [ -L "${SOURCE}/${p}" ]; then
+      case "$(readlink "${SOURCE}/${p}")" in
+        "${SHARED}"/*|"${MAIN_DIR}"/*|"${SECOND_DIR}"/*)
+          warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
+          touched=1 ;;
+      esac
+    fi
+  done
+  if [ "$touched" -eq 0 ]; then ok "nothing in ${SOURCE} points at the new directories"
+  else problems=$((problems+1)); fi
 
   hdr "Shared links"
-  local dir p
+  local dir
   for dir in "$MAIN_DIR" "$SECOND_DIR"; do
     [ -d "$dir" ] || continue
     local bad=0
@@ -440,21 +702,32 @@ do_verify() {
   hdr "Credential isolation"
   for dir in "$MAIN_DIR" "$SECOND_DIR"; do
     [ -d "$dir" ] || continue
-    if [ -L "${dir}/.credentials.json" ]; then
-      warn "$(basename "$dir")/.credentials.json is a SYMLINK. The two profiles"
-      warn "share a login. Delete the link and log that profile in again."
-      problems=$((problems+1))
-    elif [ -f "${dir}/.credentials.json" ]; then
+    for p in $PRIVATE; do
+      if [ -L "${dir}/${p}" ]; then
+        warn "$(basename "$dir")/${p} is a SYMLINK. It must be a real, per-profile"
+        warn "file or directory or the two profiles are not isolated."
+        problems=$((problems+1))
+      fi
+    done
+    if [ -f "${dir}/.credentials.json" ]; then
       ok "$(basename "$dir"): own credentials file"
     else
       info "$(basename "$dir"): no credentials file (macOS Keychain, or not logged in yet)"
     fi
   done
+  if [ "$OS" = "macos" ] && command -v security >/dev/null 2>&1; then
+    local n
+    n=$(security dump-keychain 2>/dev/null | grep -c '"svce"<blob>="Claude Code' || true)
+    info "macOS Keychain entries starting 'Claude Code': ${n:-0}"
+    info "(one per logged-in config dir, entries are keyed to CLAUDE_CONFIG_DIR;"
+    info " ${SOURCE} may hold one as well if it was ever logged in via Keychain)"
+  fi
 
   hdr "Per-profile app state (.claude.json)"
-  info "Claude Code may keep this at ~/.claude.json or inside the profile dir,"
-  info "depending on version. If it is NOT inside each profile dir, the two"
-  info "profiles share OAuth state and the isolation will not hold."
+  info "With CLAUDE_CONFIG_DIR set, Claude Code keeps this inside the profile"
+  info "dir. If a launched profile has none there, that version fell back to"
+  # shellcheck disable=SC2088
+  info "~/.claude.json, which both profiles would share: NOT isolated."
   for dir in "$MAIN_DIR" "$SECOND_DIR"; do
     [ -d "$dir" ] || continue
     if [ -f "${dir}/.claude.json" ]; then
@@ -469,7 +742,8 @@ do_verify() {
       info "$(basename "$dir"): not launched yet, nothing to check"
     fi
   done
-  [ -f "${HOME}/.claude.json" ] && info "~/.claude.json also exists (old profile's state)"
+  # shellcheck disable=SC2088
+  [ -f "${HOME}/.claude.json" ] && info "~/.claude.json also exists (old profile's state, expected)"
 
   hdr "Retention settings"
   local a b
@@ -477,20 +751,48 @@ do_verify() {
   b=$(json_num "${SECOND_DIR}/settings.json" cleanupPeriodDays)
   info "${MAIN}: cleanupPeriodDays=${a}   ${SECOND}: cleanupPeriodDays=${b}"
   if [ "$a" != "$b" ]; then
-    warn "These differ. Both profiles sweep the SAME shared projects/ directory,"
-    warn "so the shorter period wins and will delete the other's transcripts."
+    warn "These differ. Both profiles sweep the SAME shared directories,"
+    warn "so the shorter period wins and will delete the other's data."
     warn "Set them to the same value in both settings.json files."
     problems=$((problems+1))
   else
     ok "matching (or both unset, which is the 30-day default)"
   fi
 
+  hdr "Settings that still point at ${SOURCE}"
+  local refs=0
+  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+    if refs_old_profile "${dir}/settings.json"; then
+      warn "$(basename "$dir")/settings.json references paths under ~/.claude/"
+      warn "(statusLine command, hooks, or similar). Those keep working only"
+      warn "while ${SOURCE} exists. Repoint them before you delete it."
+      refs=1
+    fi
+  done
+  [ "$refs" -eq 0 ] && ok "none (safe to delete ${SOURCE} later, once you are happy)"
+
   hdr "Shell"
-  if [ -f "$SNIPPET_FILE" ]; then ok "$SNIPPET_FILE"; else warn "missing: $SNIPPET_FILE"; fi
-  if command -v "claude-${MAIN}" >/dev/null 2>&1; then
-    ok "claude-${MAIN} is on PATH in this shell"
+  local rc
+  rc=$(rc_file)
+  if [ -f "$SNIPPET_FILE" ]; then
+    ok "$SNIPPET_FILE"
+    if ! grep -q "^claude-${MAIN}()" "$SNIPPET_FILE" \
+       || ! grep -q "^claude-${SECOND}()" "$SNIPPET_FILE"; then
+      warn "snippet does not define claude-${MAIN} and claude-${SECOND};"
+      warn "it was written for different names. Re-run apply to regenerate."
+      problems=$((problems+1))
+    fi
   else
-    info "claude-${MAIN} not loaded in this shell (open a new terminal, or source the snippet)"
+    warn "missing: $SNIPPET_FILE"
+    problems=$((problems+1))
+  fi
+  if [ -z "$rc" ]; then
+    info "shell '${SHELL}' is not bash or zsh; cannot check whether it sources the snippet"
+  elif [ -f "$rc" ] && grep -qF "$SNIPPET_FILE" "$rc" 2>/dev/null; then
+    ok "${rc} sources the snippet (open a new terminal to pick it up)"
+  else
+    warn "${rc} does not source ${SNIPPET_FILE}. Add:  . \"${SNIPPET_FILE}\""
+    problems=$((problems+1))
   fi
 
   hdr "Result"
@@ -518,10 +820,22 @@ do_rollback() {
   warn "Any conversations you had ONLY under the new profiles live in"
   warn "${SHARED} and will be lost. Copy them out first if you want them."
 
+  local d
+  for d in "$MAIN_DIR" "$SECOND_DIR"; do
+    if [ -d "${d}/sessions" ] && [ -n "$(ls -A "${d}/sessions" 2>/dev/null)" ]; then
+      warn "${d}/sessions is not empty: a Claude Code session may still be"
+      warn "running in that profile. Quit it before continuing."
+    fi
+  done
+  if [ "$OS" = "macos" ]; then
+    info "macOS: the profiles' Keychain entries ('Claude Code-credentials…')"
+    info "are not removed. Delete them in Keychain Access if you want."
+  fi
+
   confirm "Remove the four paths above?" || { say "aborted"; return 0; }
 
-  local d
   for d in "$MAIN_DIR" "$SECOND_DIR" "$SHARED"; do
+    same_path "$d" "$SOURCE" && die "refusing: '${d}' is the source profile"
     [ -d "$d" ] && { info "removing ${d}"; rm -rf "$d"; }
   done
   [ -f "$SNIPPET_FILE" ] && { info "removing ${SNIPPET_FILE}"; rm -f "$SNIPPET_FILE"; }
@@ -536,6 +850,7 @@ do_rollback() {
 banner() {
   say ""
   say "claude-profiles v${VERSION}   os=${OS}  share=${SHARE_MODE}"
+  [ "$CONF_LOADED" -eq 1 ] && say "  (names/mode/source remembered from ${CONF_FILE}; flags override)"
   say "  source (never modified) : ${SOURCE}"
   say "  main profile            : ${MAIN_DIR}   (inherits current login)"
   say "  second profile          : ${SECOND_DIR}   (fresh login)"
@@ -549,6 +864,7 @@ case "$CMD" in
     preflight
     do_backup
     seed_shared
+    write_conf
     make_profile "$MAIN_DIR"   "$MAIN"   yes
     make_profile "$SECOND_DIR" "$SECOND" no
     write_snippet
@@ -561,9 +877,10 @@ case "$CMD" in
     preflight
     say ""
     say "About to create the three directories above. ${SOURCE} is only read."
-    confirm "Proceed?" || { say "aborted"; exit 0; }
+    confirm "Proceed?" || { say "aborted"; exit 1; }
     do_backup
     seed_shared
+    write_conf
     make_profile "$MAIN_DIR"   "$MAIN"   yes
     make_profile "$SECOND_DIR" "$SECOND" no
     write_snippet
@@ -581,7 +898,8 @@ case "$CMD" in
     say "     run  claude-${SECOND} --resume  in the same project directory."
     say ""
     say "  ${SOURCE} is untouched and still works. Once you are happy with"
-    say "  the new setup, you can delete it to reclaim the duplicated space."
+    say "  the new setup, you can delete it to reclaim the duplicated space"
+    say "  (verify tells you if a settings file still points into it)."
     ;;
   verify)
     banner

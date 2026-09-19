@@ -35,8 +35,19 @@ Deletes `~/.claude-work`, `~/.claude-personal`, `~/.claude-shared` and
 `~/.claude-profiles.sh`. Prompts before doing it. Leaves `~/.claude`,
 `~/.claude.json` and your backups alone.
 
-Use `--main NAME --second NAME` if you set up under non-default names, or it
-will not find the right directories.
+It reads the profile names you chose from
+`~/.claude-shared/.claude-profiles.conf`, so non-default names need no flags.
+If that file is gone, pass `--main NAME --second NAME` yourself. It refuses
+to remove a directory that turns out to be the source profile.
+
+If there is no terminal to answer the prompt (running it from Claude Code,
+for instance) it stops and asks for `--yes`. It also warns if a profile's
+`sessions/` directory is non-empty, which usually means a Claude Code session
+is still running there. Quit it first.
+
+On macOS the Keychain entries the two profiles created stay behind. They are
+harmless; delete them in Keychain Access (search for "Claude Code") if you
+want a clean slate.
 
 **Before you run this**: any conversation that happened *only* under the new
 profiles lives in `~/.claude-shared/projects/` and will be deleted. If you
@@ -64,7 +75,8 @@ cat ~/.claude-backups/.latest
 ```
 
 Restore it. Move the current directory aside rather than deleting it, so you
-can still get at anything newer:
+can still get at anything newer. Quit every Claude Code session first, since
+a running one would keep writing into the directory you are moving.
 
 ```bash
 mv ~/.claude ~/.claude.broken
@@ -74,6 +86,13 @@ tar xzf ~/.claude-backups/claude-<timestamp>.tar.gz -C "$HOME"
 
 ls -la ~/.claude
 ```
+
+The archive holds `.claude/` and `.claude.json` as paths relative to your
+home directory, so `-C "$HOME"` puts them back exactly where they were. Check
+with `tar tzf <archive> | head`. If you set up with `--source DIR` pointing
+somewhere other than `~/.claude`, the archive holds `DIR`'s basename
+relative to its parent directory instead; extract with `-C` set to that
+parent.
 
 Then log in again if needed:
 

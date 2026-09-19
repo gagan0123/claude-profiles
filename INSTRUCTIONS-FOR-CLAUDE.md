@@ -27,6 +27,10 @@ and the failure modes, and you need both.
    refuses to do something, it is refusing on purpose. Report the refusal to
    the user and ask, rather than editing the guard away.
 5. **Stop and ask before any destructive step**, including `rollback`.
+6. **Your Bash tool has no terminal.** The script's confirmation prompts
+   cannot be answered from here; without `--yes` they stop with "No terminal
+   is available". So `--yes` is how you pass on the user's approval, and it
+   is only ever added *after* the user has approved that exact step in chat.
 
 ## Procedure
 
@@ -45,7 +49,8 @@ df -h ~ | tail -1
 
 Flag it if: the OS is not Darwin or Linux; `~/.claude` does not exist;
 `CLAUDE_CONFIG_DIR` is already set; or free disk space is less than twice the
-size of `~/.claude`.
+size of `~/.claude` (the script's preflight repeats this check with exact
+numbers, and `apply` refuses to start if the copy plus backup cannot fit).
 
 **Step 2. Confirm the sharing mode.** Ask the user to pick `full` or `safe`
 and summarise the trade-off from the README's "Choose your sharing mode"
@@ -61,25 +66,35 @@ chmod +x ./claude-profiles.sh
 ```
 
 Show the user the output. Summarise in plain language what will be created and
-confirm out loud that `~/.claude` appears nowhere as a write target. Get
-explicit approval.
+confirm out loud that `~/.claude` appears nowhere as a write target (only as
+the *source* of `cp` commands). Quote the disk-space line. Get explicit
+approval.
 
-**Step 4. Apply.**
+**Step 4. Apply.** Only after the approval in Step 3:
 
 ```bash
-./claude-profiles.sh apply --share <their choice> --shell
+./claude-profiles.sh apply --share <their choice> --shell --yes
 ```
 
-Confirm the backup archive was written under `~/.claude-backups/` and tell the
-user its path.
+`--yes` is required because there is no terminal for the prompt (rule 6).
+The script takes the backup first and reads it back before touching anything
+else; if the backup step dies, nothing else has been created. Confirm the
+archive path printed under `~/.claude-backups/` and tell the user. Note that
+the run also wrote `~/.claude-shared/.claude-profiles.conf`, which is why
+later commands need no flags.
+
+If you are running inside a Claude Code session yourself, expect a `tar exit
+1` warning: the transcript of this very session is being written while it is
+archived. That is harmless and the script says so.
 
 **Step 5. Hand back for the interactive part.** You cannot do this: it needs a
 browser and a terminal the user controls. Give them these instructions:
 
 - Open a new terminal.
-- Run `claude-work`. It should already be signed in as the current account.
-  If it asks for a login, log in with the **same** account. That is expected
-  on macOS, where credentials are in the Keychain rather than in a file.
+- Run `claude-work`. On Linux it should already be signed in as the current
+  account. On macOS it **will** ask for a login, because the Keychain entry
+  is keyed to the config directory and none exists yet for `~/.claude-work`.
+  Log in with the **same** account. It is a login, not a logout.
 - Quit, run `claude-personal`, and log in with the **other** account.
 - Come back here.
 
@@ -89,12 +104,19 @@ browser and a terminal the user controls. Give them these instructions:
 ./claude-profiles.sh verify
 ```
 
-Read every warning. The section that matters most is "Per-profile app state
-(.claude.json)". If it reports that a launched profile has no `.claude.json`,
+No flags needed: it reads the names and sharing mode from
+`~/.claude-shared/.claude-profiles.conf`. Read every warning. The section
+that matters most is "Per-profile app state (.claude.json)". If it reports
+that the **second** profile has been launched but has no `.claude.json`,
 **stop**. That means this Claude Code version keeps OAuth state at
 `~/.claude.json`, shared between both profiles, and the accounts are not
 isolated. Point the user at the README section "If verify flags .claude.json"
-and do not proceed.
+and do not proceed. (The main profile received a copy of `.claude.json` at
+setup, so its presence proves nothing; the second profile's does.)
+
+The "Settings that still point at ~/.claude" section is informational: it
+means a `statusLine` command or hook path lives under `~/.claude` and the
+user must keep that directory or repoint the setting. Tell them either way.
 
 **Step 7. Prove the sharing works.** In a project directory the user has used
 before, have them run `claude-work`, send one message, quit, then run
@@ -112,12 +134,18 @@ profile should be listed. If it is not, check that
 - the two live traps: keep `cleanupPeriodDays` identical in both
   `settings.json` files, and never resume the same session in both profiles
   at once
-- that user-scope MCP servers and per-project trust do not carry over and will
-  need setting up once in the second profile
+- that user-scope MCP servers and per-project trust carried over into the
+  main profile but not the second, which needs them set up once
+- whether `verify` warned about settings pointing at `~/.claude`, and what
+  that means for deleting it later
+- that IDE extensions do not see the shell functions and will use `~/.claude`
+  unless `CLAUDE_CONFIG_DIR` is set in the IDE's own environment
 
 ## If something fails
 
 Report the exact error and stop. Do not improvise a fix that involves deleting
 directories, moving `~/.claude`, or editing the script's guards.
 `ROLLBACK.md` has the undo procedure at three levels. Use the mildest one that
-addresses the problem, and ask before running any of them.
+addresses the problem, and ask before running any of them. `rollback` needs
+`--yes` from here for the same reason `apply` did; add it only after the user
+has said yes to that specific rollback.
