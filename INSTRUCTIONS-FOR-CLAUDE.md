@@ -73,11 +73,30 @@ confirm out loud that `~/.claude` appears nowhere as a write target (only as
 the *source* of `cp` commands). Quote the disk-space line. Get explicit
 approval.
 
+**If `plan` warns that a profile directory "already holds real data"**, stop
+and deal with that before anything else. It means `~/.claude-<name>` already
+exists as a real profile, usually because the user tried `CLAUDE_CONFIG_DIR`
+by hand before finding this script, and `apply` will refuse to run at all
+until it is resolved. Show the user the exact list of paths the warning
+printed. Explain, in two sentences: `--adopt` first archives that whole
+directory to `~/.claude-backups/claude-<name>-adopted-<stamp>.tar.gz`, then
+copies into `~/.claude-shared` only the files it does not already have
+(never overwriting one, union-merging `history.jsonl` by timestamp) and
+moves the originals into `~/.claude-<name>/.adopted-<stamp>/` before
+linking; the profile's credentials, `.claude.json` and settings are left
+exactly as they are. Their alternative is to move the directory aside
+themselves and merge by hand later. Re-run `plan --adopt` so they can see
+the copied/skipped counts, get explicit approval for adopting, and only then
+add `--adopt` to the Step 4 command. Do not add it on your own initiative.
+
 **Step 4. Apply.** Only after the approval in Step 3:
 
 ```bash
 ./claude-profiles.sh apply --share <their choice> --shell --yes
 ```
+
+Add `--adopt` to that command if, and only if, Step 3 turned up pre-existing
+profile data and the user approved adopting it.
 
 `--yes` is required because there is no terminal for the prompt (rule 6).
 The script takes the backup first and reads it back before touching anything

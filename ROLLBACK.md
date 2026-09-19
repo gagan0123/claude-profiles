@@ -68,6 +68,22 @@ On macOS the Keychain entries the two profiles created stay behind. They are
 harmless; delete them in Keychain Access (search for "Claude Code") if you
 want a clean slate.
 
+**If you ran `apply --adopt`**, rollback deletes the adopted profile
+directory too, including the `.adopted-<timestamp>/` copies of the data that
+was merged out of it. The way back to the profile exactly as it was before
+adoption is the archive taken at the start of the adopt run:
+
+```bash
+ls -la ~/.claude-backups/claude-*-adopted-*.tar.gz
+tar xzf ~/.claude-backups/claude-personal-adopted-<timestamp>.tar.gz -C "$HOME"
+```
+
+It holds the whole directory (credentials, `.claude.json`, transcripts and
+all) as a path relative to your home directory, so `-C "$HOME"` puts it back
+where it was. Move anything currently at that path aside first. Extract it
+*before* rollback if you want to keep working with those sessions, or
+afterwards to recover them.
+
 **Before you run this**: any conversation that happened *only* under the new
 profiles lives in `~/.claude-shared/projects/` and will be deleted. If you
 want those, copy them out first:

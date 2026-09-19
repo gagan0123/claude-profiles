@@ -48,7 +48,12 @@ bug even if every test passes.
    is explicitly branched on `DRY`. A new write that bypasses both is a bug.
 5. **`apply` must be idempotent and interruptible.** Re-running must skip
    what exists; an interrupted copy must not look finished (that is why
-   shared paths are copied to `.<name>.partial` and renamed).
+   shared paths are copied to `.<name>.partial` and renamed). `--adopt` is
+   the only path that changes a profile directory that existed before the
+   run, and it always archives that whole directory to `~/.claude-backups`
+   (written and read back) before it merges or moves anything, never
+   overwrites a file already in the shared copy, and moves originals into
+   `.adopted-<stamp>/` rather than deleting them.
 6. **Prompts fail closed.** If there is no terminal, `confirm` returns false
    and says to pass `--yes`. Never fall back to "assume yes".
 7. **The backup is taken and read back before anything else is created**,
@@ -96,10 +101,11 @@ It builds a fake `$HOME` under `$TMPDIR`, seeds a fake `~/.claude`, and runs
 `plan`, an `apply` without a TTY (must abort), `apply --yes --shell`, the
 launcher functions against a stub `claude` binary, a second `apply`,
 `verify` in clean and deliberately broken states, bad-input rejection,
-`rollback`, a `--share safe` setup with custom names, a level-3 restore
-from the backup archive, and `finalize` (each gate's refusal, then the real
-deletion and the state it leaves behind). It never reads or writes the real
-`~/.claude`.
+`rollback`, an `--adopt` run against a pre-existing second profile (refusal
+without the flag, archive, no-overwrite merge, history union, `.adopted-*`),
+a `--share safe` setup with custom names, a level-3 restore from the backup
+archive, and `finalize` (each gate's refusal, then the real deletion and
+the state it leaves behind). It never reads or writes the real `~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
 fix a bug, add the case that would have caught it first.

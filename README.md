@@ -134,7 +134,12 @@ account. The script is built around avoiding that:
 4. **`plan` is a real dry run.** It prints every command it would execute and
    changes nothing. Run it first, read it, then run `apply`.
 5. **`apply` refuses to clobber.** If a path where a symlink should go already
-   holds real data, it warns and skips rather than deleting.
+   holds real data, it warns and skips rather than deleting. When a whole
+   profile directory turns out to be real data, `apply` stops in preflight,
+   before the backup and before anything is created, and tells you to re-run
+   with `--adopt` (which archives that directory first and merges its data
+   into the shared copy without overwriting anything) or to move the
+   directory aside. See "If a profile directory already exists" below.
 6. **`apply` is idempotent.** Running it twice is safe. Each shared path is
    copied under a temporary name and renamed only when the copy completes, so
    an interrupted run (Ctrl-C, disk full) leaves nothing that a second run
@@ -153,6 +158,67 @@ new setup for a week and are happy, run `./claude-profiles.sh finalize` to
 reclaim the space. Do not `rm -rf ~/.claude` by hand: see
 [When you are done: finalize](#when-you-are-done-finalize) for what that
 would take out with it.
+
+---
+
+## If a profile directory already exists
+
+Plenty of people find this script *after* trying `CLAUDE_CONFIG_DIR` by hand.
+Then `~/.claude-work` or `~/.claude-personal` is not an empty slot: it is a
+complete, logged-in profile with its own `.credentials.json` and
+`.claude.json`, a `projects/` tree that is part hand-copy of
+`~/.claude/projects` and part sessions that exist nowhere else, its own
+`history.jsonl`, `file-history/`, `skills/` and so on.
+
+**By default `apply` refuses to run at all in that situation.** It stops in
+preflight -- before the backup, before anything is created -- lists the paths
+that hold real data, and exits. `plan` prints the same list as a warning and
+then shows you the rest of the plan anyway, so you can see the whole picture
+before deciding. Linking over that data is the one thing that would actually
+lose conversations, so the refusal is deliberate and is not a bug.
+
+You have two ways forward. Either move the directory aside yourself
+(`mv ~/.claude-personal ~/.claude-personal.old`) and re-run, which gives you
+a clean profile and leaves you to merge the old sessions by hand, or:
+
+```bash
+./claude-profiles.sh plan  --adopt          # read this first
+./claude-profiles.sh apply --adopt
+```
+
+`--adopt` merges the existing profile into the shared copy, in this order,
+per profile directory:
+
+1. **Archives the whole directory first**, to
+   `~/.claude-backups/claude-<profile>-adopted-<timestamp>.tar.gz`, with the
+   same discipline as the main backup: mode 700 directory, mode 600 archive
+   (it contains credentials), and a `tar tzf` read-back before anything else
+   happens. If that archive cannot be written or cannot be read back, the run
+   dies there and nothing is merged.
+2. **Copies in only what is missing.** For each shared directory
+   (`projects/`, `file-history/`, `skills/`, ...) every file that does not
+   already exist at the same relative path under `~/.claude-shared/` is
+   copied in with its mtime intact. A file that is already there is never
+   overwritten -- the shared copy always wins -- and the run prints both
+   counts, copied and skipped.
+3. **Union-merges `history.jsonl`**: the lines of the shared file plus the
+   lines of the profile's file, exact duplicates dropped, ordered by the
+   numeric `timestamp` field (lines without one keep their relative order and
+   sort first). Line counts before and after are printed.
+4. **Moves the originals aside** into `~/.claude-<profile>/.adopted-<stamp>/`
+   and only then creates the symlink. Nothing is deleted at any point: the
+   data is in the archive *and* in `.adopted-<stamp>/`. `verify` lists those
+   directories and tells you to delete them once you are happy.
+5. **Leaves everything that is not shared exactly where it is.**
+   `.credentials.json`, `.claude.json`, `sessions/`, `shell-snapshots/` and
+   the rest are untouched, so the profile stays logged in as whichever
+   account it already holds. In particular, a `~/.claude-<main>` that already
+   has credentials keeps them; they are never overwritten from `~/.claude`.
+
+`plan --adopt` computes and prints the same copy, skip and line counts by
+reading, and writes nothing. The profile name is recorded as
+`ADOPTED=<name>` in `~/.claude-shared/.claude-profiles.conf`, which is what
+`verify` reports later.
 
 ---
 

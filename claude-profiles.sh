@@ -47,7 +47,19 @@ SHARE_MODE="full"
 DO_SHELL=0
 DO_BACKUP=1
 ASSUME_YES=0
+ADOPT=0
 CMD=""
+
+# One timestamp for the whole run, so an adopt archive and the .adopted-<stamp>
+# directory it came from carry the same name.
+RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
+
+# Filled in by preflight(): the SHARE_ALL paths that already exist as real
+# (non-symlink) data inside each profile directory, one per line. Empty in the
+# normal case of a fresh setup.
+ADOPT_PATHS_MAIN=""
+ADOPT_PATHS_SECOND=""
+ADOPTED_NAMES=""
 
 # Which options were given explicitly on the command line. Anything not given
 # explicitly falls back to the values recorded at apply time (see CONF_FILE),
@@ -57,6 +69,7 @@ CONF_LOADED=0
 CONF_CLAUDE_VERSION=""
 CONF_SOURCE=""
 CONF_FINALIZED=""
+CONF_ADOPTED=""
 
 # Session data. "full" gives you cross-profile --resume and --continue.
 # "safe" deliberately leaves transcripts and checkpoints per-profile so that
@@ -213,6 +226,15 @@ Options:
   --source DIR      profile to seed from (default: ${SOURCE})
   --shell           append the launcher functions to your shell rc file
                     (without this, the snippet is written out for you to add)
+  --adopt           merge data that is ALREADY in ~/.claude-<name> into the
+                    shared copy instead of refusing to touch it. Archives the
+                    whole profile directory to ${BACKUP_ROOT} first, copies in
+                    only files the shared copy does not already have (never
+                    overwrites), union-merges history.jsonl by timestamp, then
+                    moves the originals to <profile>/.adopted-<stamp> and links
+                    the paths. Credentials, .claude.json, settings.json and
+                    anything else not shared are left untouched. See README.md,
+                    "If a profile directory already exists".
   --no-backup       skip the tar backup (only sensible on a re-run of apply).
                     For finalize it does not skip the check: an existing,
                     readable archive named by ${BACKUP_ROOT}/.latest
@@ -250,6 +272,7 @@ while [ $# -gt 0 ]; do
     --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
     --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
     --shell)  DO_SHELL=1; shift ;;
+    --adopt)  ADOPT=1; shift ;;
     --no-backup) DO_BACKUP=0; shift ;;
     --yes)    ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -275,6 +298,7 @@ if [ -f "$CONF_FILE" ]; then
                   if [ "$SOURCE_SET" -eq 0 ]; then SOURCE="$v";     fi ;;
       CLAUDE_VERSION) CONF_CLAUDE_VERSION="$v" ;;
       FINALIZED)  CONF_FINALIZED="$v" ;;
+      ADOPTED)    CONF_ADOPTED="$v" ;;
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
@@ -372,6 +396,52 @@ preflight() {
     fi
   done
 
+  # Data already sitting in a profile directory. This is the case where the
+  # user tried CLAUDE_CONFIG_DIR by hand before finding this script, so
+  # ~/.claude-<name> is a complete logged-in profile with transcripts that
+  # exist nowhere else. make_profile() cannot link over that, so without
+  # --adopt this is a hard stop for apply (and a warning for plan) rather
+  # than a half-linked profile discovered afterwards.
+  ADOPT_PATHS_MAIN=$(profile_real_share_paths "$MAIN_DIR")
+  ADOPT_PATHS_SECOND=$(profile_real_share_paths "$SECOND_DIR")
+  if [ -n "$ADOPT_PATHS_MAIN" ] || [ -n "$ADOPT_PATHS_SECOND" ]; then
+    say ""
+    if [ -n "$ADOPT_PATHS_MAIN" ]; then
+      warn "'${MAIN_DIR}' already holds real data (not symlinks) at:"
+      warn "  $(printf '%s' "$ADOPT_PATHS_MAIN" | tr '\n' ' ')"
+    fi
+    if [ -n "$ADOPT_PATHS_SECOND" ]; then
+      warn "'${SECOND_DIR}' already holds real data (not symlinks) at:"
+      warn "  $(printf '%s' "$ADOPT_PATHS_SECOND" | tr '\n' ' ')"
+    fi
+    if [ "$ADOPT" -eq 1 ]; then
+      # Recorded in the conf file by write_conf(), which runs before the
+      # merge itself, so the names are worked out here.
+      if [ -n "$ADOPT_PATHS_MAIN" ]; then
+        ADOPTED_NAMES="${ADOPTED_NAMES}${ADOPTED_NAMES:+ }${MAIN}"
+      fi
+      if [ -n "$ADOPT_PATHS_SECOND" ]; then
+        ADOPTED_NAMES="${ADOPTED_NAMES}${ADOPTED_NAMES:+ }${SECOND}"
+      fi
+      info "--adopt given: each directory above is archived to ${BACKUP_ROOT}"
+      info "first, then those paths are merged into ${SHARED} without ever"
+      info "overwriting a file that is already there, and moved aside into"
+      info "<profile>/.adopted-${RUN_STAMP}/ before the links are made."
+    else
+      warn "--adopt archives the profile directory to ${BACKUP_ROOT}, then merges"
+      warn "those paths into ${SHARED}: files the shared copy does not have are"
+      warn "copied in, nothing is ever overwritten, history.jsonl is union-merged"
+      warn "by timestamp, and the originals move to <profile>/.adopted-<stamp>."
+      warn "Credentials, .claude.json and settings.json are left exactly as they are."
+      if [ "$CMD" = "apply" ]; then
+        die "refusing to touch an existing profile directory. Re-run with --adopt
+       to merge the data listed above, or move the directory aside first.
+       Nothing has been created or backed up yet."
+      fi
+      warn "apply would stop here. Re-run plan/apply with --adopt to proceed."
+    fi
+  fi
+
   if [ "$OS" = "macos" ]; then
     info "macOS: credentials live in the Keychain, keyed to the config dir."
     info "The '${MAIN}' profile will prompt for a browser login on first"
@@ -388,7 +458,17 @@ preflight() {
   done
   src_kb=$(dir_kb "$SOURCE")
   total=$need
-  [ "$DO_BACKUP" -eq 1 ] && total=$((total + src_kb))
+  if [ "$DO_BACKUP" -eq 1 ]; then total=$((total + src_kb)); fi
+  # --adopt archives each pre-existing profile directory as well, and copies
+  # whatever the shared dir is missing out of it. Budget for both at full size.
+  if [ "$ADOPT" -eq 1 ]; then
+    if [ -n "$ADOPT_PATHS_MAIN" ]; then
+      total=$((total + 2 * $(dir_kb "$MAIN_DIR")))
+    fi
+    if [ -n "$ADOPT_PATHS_SECOND" ]; then
+      total=$((total + 2 * $(dir_kb "$SECOND_DIR")))
+    fi
+  fi
   have=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
   info "source profile size: $(kb_h "$src_kb")"
   info "disk: copy needs ~$(kb_h "$need"), backup up to $(kb_h "$src_kb"), free $(kb_h "$have")"
@@ -401,6 +481,43 @@ preflight() {
 }
 
 # ------------------------------------------------------------------ backup --
+
+archive_tree() {
+  # $1 = archive path; the rest are tar operands (positional -C pairs, which
+  # both GNU tar and bsdtar accept). Creates BACKUP_ROOT as mode 700, writes
+  # the archive under umask 077 because it contains credentials, and reads it
+  # back with tar tzf before declaring success. Honours DRY.
+  #
+  # Returns 0 on success, 90 if the archive does not read back, otherwise
+  # tar's exit status. The caller words the fatal message, because "backup"
+  # and "adopt archive" fail for different reasons and at different points.
+  local archive="$1"; shift
+  if [ "$DRY" -eq 1 ]; then
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} mkdir -p ${BACKUP_ROOT} && chmod 700 ${BACKUP_ROOT}"
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} (umask 077; tar czf ${archive} $*)"
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} tar tzf ${archive} >/dev/null   # read-back check"
+    return 0
+  fi
+
+  mkdir -p "$BACKUP_ROOT"
+  chmod 700 "$BACKUP_ROOT"
+
+  local st=0
+  ( umask 077; tar czf "$archive" "$@" ) 2>"${archive}.log" || st=$?
+
+  if [ "$st" -ne 0 ]; then
+    if [ "$st" -eq 1 ] && [ -s "$archive" ]; then
+      warn "tar exit 1: some files changed or were unreadable while archiving."
+      warn "Usual cause: a Claude Code session is running. Details: ${archive}.log"
+    else
+      return "$st"
+    fi
+  fi
+
+  tar tzf "$archive" >/dev/null 2>&1 || return 90
+  [ -s "${archive}.log" ] || rm -f "${archive}.log"
+  return 0
+}
 
 do_backup() {
   hdr "Backup"
@@ -419,40 +536,24 @@ do_backup() {
   info "contents: ${SOURCE}${SRC_STATE:+ and ${SRC_STATE}}"
   info "mode 600, in a mode 700 directory: the archive contains credentials"
 
+  st=0
+  if [ -n "$SRC_STATE" ]; then
+    archive_tree "$archive" -C "$parent" "$base" \
+      -C "$(dirname "$SRC_STATE")" "$(basename "$SRC_STATE")" || st=$?
+  else
+    archive_tree "$archive" -C "$parent" "$base" || st=$?
+  fi
+
+  if [ "$st" -eq 90 ]; then
+    die "backup archive does not read back cleanly: ${archive}. Not continuing."
+  elif [ "$st" -ne 0 ]; then
+    die "backup FAILED (tar exit ${st}). See ${archive}.log. Nothing else was changed."
+  fi
+
   if [ "$DRY" -eq 1 ]; then
-    printf '%s\n' "  ${C_DIM}would run:${C_OFF} mkdir -p ${BACKUP_ROOT} && chmod 700 ${BACKUP_ROOT}"
-    printf '%s\n' "  ${C_DIM}would run:${C_OFF} (umask 077; tar czf ${archive} -C ${parent} ${base}${SRC_STATE:+ -C $(dirname "$SRC_STATE") $(basename "$SRC_STATE")})"
-    printf '%s\n' "  ${C_DIM}would run:${C_OFF} tar tzf ${archive} >/dev/null   # read-back check"
     return 0
   fi
 
-  mkdir -p "$BACKUP_ROOT"
-  chmod 700 "$BACKUP_ROOT"
-
-  st=0
-  (
-    umask 077
-    if [ -n "$SRC_STATE" ]; then
-      tar czf "$archive" -C "$parent" "$base" \
-        -C "$(dirname "$SRC_STATE")" "$(basename "$SRC_STATE")"
-    else
-      tar czf "$archive" -C "$parent" "$base"
-    fi
-  ) 2>"${archive}.log" || st=$?
-
-  if [ "$st" -ne 0 ]; then
-    if [ "$st" -eq 1 ] && [ -s "$archive" ]; then
-      warn "tar exit 1: some files changed or were unreadable while archiving."
-      warn "Usual cause: a Claude Code session is running. Details: ${archive}.log"
-    else
-      die "backup FAILED (tar exit ${st}). See ${archive}.log. Nothing else was changed."
-    fi
-  fi
-
-  tar tzf "$archive" >/dev/null 2>&1 \
-    || die "backup archive does not read back cleanly: ${archive}. Not continuing."
-
-  [ -s "${archive}.log" ] || rm -f "${archive}.log"
   ok "backup written and read back ($(du -sh "$archive" | cut -f1))"
   printf '%s\n' "$archive" > "${BACKUP_ROOT}/.latest"
 }
@@ -494,9 +595,23 @@ seed_shared() {
   done
 }
 
+adopted_value() {
+  # The ADOPTED= line for the conf file: whatever a previous apply recorded,
+  # plus whatever this run adopted, comma separated and deduped. A later
+  # re-apply that adopts nothing must not erase the earlier record.
+  local out="$CONF_ADOPTED" n
+  for n in $ADOPTED_NAMES; do
+    case ",${out}," in
+      *",${n},"*) ;;
+      *) if [ -n "$out" ]; then out="${out},${n}"; else out="$n"; fi ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 write_conf() {
   if [ "$DRY" -eq 1 ]; then
-    info "would record MAIN/SECOND/SHARE_MODE/SOURCE/CLAUDE_VERSION in ${CONF_FILE}"
+    info "would record MAIN/SECOND/SHARE_MODE/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
     return 0
   fi
   {
@@ -506,6 +621,7 @@ write_conf() {
     printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
     printf 'SOURCE=%s\n'     "$SOURCE"
     printf 'CLAUDE_VERSION=%s\n' "$(claude_version)"
+    printf 'ADOPTED=%s\n'    "$(adopted_value)"
   } > "$CONF_FILE"
   ok "recorded settings in ${CONF_FILE}"
 }
@@ -612,6 +728,203 @@ relocate_settings_scripts() {
   done
 }
 
+# ------------------------------------------------------------------ adopt --
+#
+# The case this exists for: the user set CLAUDE_CONFIG_DIR by hand before
+# finding this script, so ~/.claude-<name> is already a complete, logged-in
+# profile. Its projects/ tree is part hand-copy of ~/.claude/projects and part
+# sessions that exist nowhere else; its history.jsonl is a union of copied and
+# new lines. make_profile() will not link over real data, so --adopt merges it
+# into the shared copy first. The rule throughout is that the shared copy wins:
+# nothing already in ${SHARED} is ever overwritten, and the profile's originals
+# are archived AND moved aside rather than deleted.
+
+profile_real_share_paths() {
+  # Print each SHARE_ALL path that exists inside $1 as real (non-symlink)
+  # data, one per line. Nothing else in the profile directory is listed:
+  # .credentials.json, .claude.json, settings.json, sessions/ and friends are
+  # none of adopt's business.
+  local dir="$1" p
+  if [ -d "$dir" ]; then
+    for p in $SHARE_ALL; do
+      if [ ! -L "${dir}/${p}" ] && [ -e "${dir}/${p}" ]; then
+        printf '%s\n' "$p"
+      fi
+    done
+  fi
+  return 0
+}
+
+adopt_list_for() {
+  # The adopt list belonging to a profile directory, for make_profile().
+  if [ "$1" = "$MAIN_DIR" ]; then printf '%s' "$ADOPT_PATHS_MAIN"
+  else printf '%s' "$ADOPT_PATHS_SECOND"; fi
+}
+
+in_list() {
+  local needle="$1" hay="$2" x
+  for x in $hay; do
+    if [ "$x" = "$needle" ]; then return 0; fi
+  done
+  return 1
+}
+
+merge_tree() {
+  # Copy every file under $1 that does not already exist at the same relative
+  # path under $2 (the reference) into $3 (the destination). Reference and
+  # destination differ only in plan mode, where ${SHARED}/<p> does not exist
+  # yet and the source profile's copy is what seed_shared would have put
+  # there. $4 is the path name, for reporting.
+  #
+  # Portability: `cp -Rpn` exists on GNU and BSD cp but reports nothing about
+  # what it skipped (and BSD cp -n exits 1 on a skip), so the skip/copy counts
+  # would be a guess. find + an explicit [ -e ] guard per file gives exact
+  # counts and the same no-clobber guarantee on both. -Rp keeps mtimes, which
+  # Claude Code sorts --resume by, and copies a symlink as a symlink.
+  local src="$1" ref="$2" dst="$3" p="$4"
+  local rel copied=0 skipped=0
+  while IFS= read -r rel; do
+    rel="${rel#./}"
+    if [ -z "$rel" ]; then continue; fi
+    if [ -e "${ref}/${rel}" ] || [ -L "${ref}/${rel}" ]; then
+      skipped=$((skipped+1))
+      continue
+    fi
+    copied=$((copied+1))
+    # Explicitly branched on DRY rather than routed through run(), because a
+    # per-file "would run:" line would be thousands of lines of plan output.
+    if [ "$DRY" -eq 0 ]; then
+      mkdir -p "$(dirname "${dst}/${rel}")"
+      cp -Rp "${src}/${rel}" "${dst}/${rel}"
+    fi
+  done < <(cd "$src" && find . ! -type d -print)
+
+  if [ "$DRY" -eq 1 ]; then
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} cp -Rp, per file, no overwrite: ${copied} file(s) from ${src} into ${dst}"
+  fi
+  info "merge  ${p}/: ${copied} copied in, ${skipped} skipped (already in ${SHARED})"
+}
+
+jsonl_union() {
+  # Print the union of the lines of $1 (may be absent) and $2: exact duplicate
+  # lines dropped, ordered by the numeric "timestamp" field. Lines without one
+  # get 0 and therefore sort first. sort -s (GNU and BSD) is stable, so inside
+  # one timestamp the input order survives, and $1 is read first, so the
+  # shared file's existing order is preserved.
+  #
+  # awk prefixes each line with the timestamp and a tab; cut -f2- strips it
+  # again. cut is used rather than sed because BSD sed does not understand \t
+  # in a pattern.
+  local a="$1" b="$2"
+  # The $0 / $2 inside are awk's fields, not the shell's: single quotes are
+  # required here, not a mistake. Held in a variable because the two awk
+  # invocations below (one file or two) must run the identical program.
+  # shellcheck disable=SC2016
+  local prog='
+    !seen[$0]++ {
+      ts = 0
+      if (match($0, /"timestamp" *: *[0-9]+/)) {
+        s = substr($0, RSTART, RLENGTH)
+        sub(/^[^0-9]*/, "", s)
+        ts = s + 0
+      }
+      printf "%s\t%s\n", ts, $0
+    }'
+  if [ -f "$a" ]; then
+    awk "$prog" "$a" "$b"
+  else
+    awk "$prog" "$b"
+  fi | sort -n -k1,1 -s | cut -f2-
+}
+
+merge_jsonl() {
+  # $1 = the profile's file, $2 = reference (shared file, or what seed would
+  # have made it in plan mode), $3 = the shared file to write, $4 = path name.
+  local src="$1" ref="$2" dst="$3" p="$4"
+  local a=0 b n tmp
+  if [ -f "$ref" ]; then a=$(wc -l < "$ref" | tr -d ' '); fi
+  b=$(wc -l < "$src" | tr -d ' ')
+
+  if [ "$DRY" -eq 1 ]; then
+    n=$(jsonl_union "$ref" "$src" | wc -l | tr -d ' ')
+    printf '%s\n' "  ${C_DIM}would run:${C_OFF} union-merge ${src} into ${dst}, deduped and sorted by timestamp"
+  else
+    # Temp file in $SHARED so the rename is on one filesystem and atomic.
+    tmp="${SHARED}/.${p}.merge.$$"
+    jsonl_union "$ref" "$src" > "$tmp"
+    n=$(wc -l < "$tmp" | tr -d ' ')
+    mv "$tmp" "$dst"
+  fi
+  info "merge  ${p}: ${a} shared + ${b} in profile -> ${n} unique line(s)"
+}
+
+do_adopt() {
+  # $1 = profile dir, $2 = profile name, $3 = its adopt list (newline
+  # separated). Runs after seed_shared (so ${SHARED}/<p> exists) and before
+  # make_profile for the same directory.
+  local dir="$1" label="$2" paths="$3"
+  if [ "$ADOPT" -eq 0 ] || [ -z "$paths" ]; then return 0; fi
+
+  hdr "Adopt existing data: ${dir}"
+
+  local archive parent base st=0
+  archive="${BACKUP_ROOT}/claude-${label}-adopted-${RUN_STAMP}.tar.gz"
+  parent=$(dirname "$dir")
+  base=$(basename "$dir")
+  info "archive:  ${archive}"
+  info "contents: ${dir} (the whole directory, before anything is merged)"
+  info "mode 600, in a mode 700 directory: the archive contains credentials"
+  archive_tree "$archive" -C "$parent" "$base" || st=$?
+  if [ "$st" -eq 90 ]; then
+    die "adopt archive does not read back cleanly: ${archive}. Nothing merged."
+  elif [ "$st" -ne 0 ]; then
+    die "adopt archive FAILED (tar exit ${st}). See ${archive}.log. Nothing merged."
+  fi
+  if [ "$DRY" -eq 0 ]; then
+    ok "adopt archive written and read back ($(du -sh "$archive" | cut -f1))"
+  fi
+
+  local p src dst ref aside
+  aside="${dir}/.adopted-${RUN_STAMP}"
+  for p in $paths; do
+    src="${dir}/${p}"
+    dst="${SHARED}/${p}"
+    ref="$dst"
+    if [ ! -e "$ref" ] && [ "$DRY" -eq 1 ] && [ -e "${SOURCE}/${p}" ]; then
+      # plan: seed_shared has not run for real, so compare against what it
+      # would have copied in. Read-only either way.
+      ref="${SOURCE}/${p}"
+    fi
+
+    if [ -d "$src" ]; then
+      if [ -e "$ref" ] && [ ! -d "$ref" ]; then
+        warn "'${p}' is a directory in ${dir} but a file in ${SHARED}."
+        warn "Not merged; the whole directory is set aside below instead."
+      else
+        merge_tree "$src" "$ref" "$dst" "$p"
+      fi
+    else
+      case "$p" in
+        *.jsonl)
+          if [ -e "$ref" ] && [ ! -f "$ref" ]; then
+            warn "'${p}' is a file in ${dir} but not a file in ${SHARED}."
+            warn "Not merged; set aside below instead."
+          else
+            merge_jsonl "$src" "$ref" "$dst" "$p"
+          fi ;;
+        *)
+          info "keep   ${p} (the shared copy wins; the profile's file is only"
+          info "       set aside, never merged: it is not a transcript store)" ;;
+      esac
+    fi
+
+    run mkdir -p "$aside"
+    run mv "$src" "${aside}/${p}"
+  done
+
+  info "originals moved to ${aside}/ (also in ${archive})"
+}
+
 # ---------------------------------------------------------------- profiles --
 
 make_profile() {
@@ -664,8 +977,16 @@ make_profile() {
       continue
     fi
     if [ -e "${dir}/${p}" ]; then
-      warn "'${dir}/${p}' exists and is NOT a symlink."
-      warn "Refusing to replace real data. Move it aside, then re-run apply."
+      # In plan mode with --adopt the data is still there, because do_adopt
+      # only printed what it would move. Say what apply would do instead of
+      # the refusal, which would be wrong.
+      if [ "$DRY" -eq 1 ] && [ "$ADOPT" -eq 1 ] && in_list "$p" "$(adopt_list_for "$dir")"; then
+        info "link   ${p} -> ${SHARED}/${p} (once adopt has moved the existing data aside)"
+      else
+        warn "'${dir}/${p}' exists and is NOT a symlink."
+        warn "Refusing to replace real data. Move it aside, or re-run with"
+        warn "--adopt to merge it into ${SHARED} first."
+      fi
       continue
     fi
     info "link   ${p} -> ${SHARED}/${p}"
@@ -923,6 +1244,31 @@ do_verify() {
       problems=$((problems+bad))
     fi
   done
+
+  hdr "Adopted data"
+  # A .adopted-<stamp> directory is what --adopt left behind: the profile's
+  # own copies of the shared paths, after their contents were merged into
+  # ${SHARED}. It is not a fault, and nothing above should be read as one.
+  local ad any_adopted=0
+  if [ -n "$CONF_ADOPTED" ]; then
+    info "conf records --adopt was used for: ${CONF_ADOPTED}"
+    any_adopted=1
+  fi
+  for dir in "$MAIN_DIR" "$SECOND_DIR"; do
+    [ -d "$dir" ] || continue
+    for ad in "${dir}"/.adopted-*; do
+      if [ -d "$ad" ]; then
+        info "${ad}"
+        info "  the profile's pre-adopt copies, already merged into ${SHARED}."
+        info "  Not a problem. Delete it when you are happy (the same data is"
+        info "  also in the claude-*-adopted-*.tar.gz archive in ${BACKUP_ROOT})."
+        any_adopted=1
+      fi
+    done
+  done
+  if [ "$any_adopted" -eq 0 ]; then
+    info "none (no profile directory held data that had to be adopted)"
+  fi
 
   hdr "Credential isolation"
   for dir in "$MAIN_DIR" "$SECOND_DIR"; do
@@ -1454,7 +1800,9 @@ case "$CMD" in
     do_backup
     seed_shared
     write_conf
+    do_adopt "$MAIN_DIR"   "$MAIN"   "$ADOPT_PATHS_MAIN"
     make_profile "$MAIN_DIR"   "$MAIN"   yes
+    do_adopt "$SECOND_DIR" "$SECOND" "$ADOPT_PATHS_SECOND"
     make_profile "$SECOND_DIR" "$SECOND" no
     write_snippet
     hdr "Plan complete"
@@ -1470,7 +1818,9 @@ case "$CMD" in
     do_backup
     seed_shared
     write_conf
+    do_adopt "$MAIN_DIR"   "$MAIN"   "$ADOPT_PATHS_MAIN"
     make_profile "$MAIN_DIR"   "$MAIN"   yes
+    do_adopt "$SECOND_DIR" "$SECOND" "$ADOPT_PATHS_SECOND"
     make_profile "$SECOND_DIR" "$SECOND" no
     write_snippet
     hdr "Next steps"

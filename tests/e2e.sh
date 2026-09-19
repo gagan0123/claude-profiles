@@ -334,6 +334,104 @@ bash "$SCRIPT" rollback --yes > "$T/rollback2.out" 2>&1; rc=$?
 check "second rollback exits 0" "[ $rc -eq 0 ]"
 check "second rollback reports nothing to remove from rc" "grep -qi 'no claude-profiles lines found' $T/rollback2.out"
 
+echo "=== adopt: pre-existing second profile ==="
+# The real-world case: the user tried CLAUDE_CONFIG_DIR by hand before finding
+# this script, so ~/.claude-personal is already a complete, logged-in profile
+# whose projects/ tree is part hand-copy of ~/.claude/projects and part
+# sessions that exist nowhere else. The rollback above left a clean slate, so
+# build that state here.
+P="$HOME/.claude-personal"
+mkdir -p "$P/projects/-fake-proj" "$P/projects/-other-proj" "$P/file-history/uniq-sess" "$P/skills/y"
+printf '{"claudeAiOauth":{"accessToken":"FAKE-WORK"}}\n' > "$P/.credentials.json"
+chmod 600 "$P/.credentials.json"
+printf '{"hasCompletedOnboarding":true,"oauthAccount":{"emailAddress":"second@b"}}\n' > "$P/.claude.json"
+# Same relative path as the source's session but different content: the shared
+# copy (seeded from ~/.claude) must win, this one must not overwrite it.
+printf '{"type":"user","msg":"PROFILE-COPY"}\n' > "$P/projects/-fake-proj/s1.jsonl"
+# Exists nowhere else.
+printf '{"type":"user","msg":"only-in-personal"}\n' > "$P/projects/-other-proj/u1.jsonl"
+printf '{"checkpoint":"only-in-personal"}\n' > "$P/file-history/uniq-sess/1.json"
+printf 'name: y\n' > "$P/skills/y/SKILL.md"
+# Two copies of the line the source has (both must dedupe away against the
+# shared copy), two unique timestamped lines written out of order, and one
+# unique line with no timestamp at all.
+{ printf '{"display":"prompt one"}\n'
+  printf '{"display":"prompt one"}\n'
+  printf '{"display":"p-two","timestamp":200}\n'
+  printf '{"display":"p-one","timestamp":100}\n'
+  printf '{"display":"p-no-timestamp"}\n'; } > "$P/history.jsonl"
+cp "$P/.credentials.json" "$T/p-creds.before"
+cp "$P/.claude.json" "$T/p-state.before"
+n_tars=$(ls "$HOME/.claude-backups"/*.tar.gz 2>/dev/null | wc -l)
+hist_sorted() {
+  awk '{ ts = 0
+         if (match($0, /"timestamp" *: *[0-9]+/)) {
+           s = substr($0, RSTART, RLENGTH); sub(/^[^0-9]*/, "", s); ts = s + 0 }
+         if (ts < prev) exit 1
+         prev = ts }' "$1"
+}
+all_share_linked() {
+  for p in projects history.jsonl file-history plans tasks paste-cache \
+           image-cache uploads session-env agent-memory skills commands \
+           agents workflows rules output-styles plugins; do
+    [ -L "$1/$p" ] || return 1
+  done
+  return 0
+}
+
+bash "$SCRIPT" apply --yes --shell > "$T/adopt-refuse.out" 2>&1; rc=$?
+check "apply without --adopt refuses" "[ $rc -ne 0 ] && grep -q -- '--adopt' $T/adopt-refuse.out && grep -q 'already holds real data' $T/adopt-refuse.out"
+check "refusal lists the paths concerned" "grep -q 'projects' $T/adopt-refuse.out && grep -q 'history.jsonl' $T/adopt-refuse.out && grep -q 'file-history' $T/adopt-refuse.out"
+check "refused apply created nothing" "[ ! -e $HOME/.claude-shared ] && [ ! -e $HOME/.claude-work ]"
+check "refused apply took no backup" "[ \$(ls $HOME/.claude-backups/*.tar.gz | wc -l) -eq $n_tars ]"
+
+bash "$SCRIPT" plan > "$T/adopt-plan.out" 2>&1; rc=$?
+check "plan without --adopt exits 0" "[ $rc -eq 0 ]"
+check "plan without --adopt warns and still shows the whole plan" "grep -q 'already holds real data' $T/adopt-plan.out && grep -q -- '--adopt' $T/adopt-plan.out && grep -q 'Plan complete' $T/adopt-plan.out"
+check "plan with existing data creates nothing" "[ ! -e $HOME/.claude-shared ] && [ ! -e $HOME/.claude-work ]"
+
+bash "$SCRIPT" plan --adopt > "$T/adopt-plan2.out" 2>&1; rc=$?
+check "plan --adopt exits 0 and previews the merge counts" "[ $rc -eq 0 ] && grep -q 'merge  projects/' $T/adopt-plan2.out && grep -q 'unique line' $T/adopt-plan2.out"
+check "plan --adopt changed nothing in the profile" "[ ! -L $P/projects ] && [ -f $P/projects/-other-proj/u1.jsonl ] && [ -z \"\$(ls -d $P/.adopted-* 2>/dev/null)\" ] && [ ! -e $HOME/.claude-shared ]"
+
+bash "$SCRIPT" apply --adopt --yes --shell > "$T/adopt-apply.out" 2>&1; rc=$?
+check "apply --adopt exits 0" "[ $rc -eq 0 ]"
+after_adopt=$(snap)
+check "source profile byte-identical after adopt" "[ '$before' = '$after_adopt' ]"
+ADOPT_TAR=$(ls "$HOME/.claude-backups"/claude-personal-adopted-*.tar.gz 2>/dev/null | head -1)
+check "adopt archive exists, mode 600" "[ -n '$ADOPT_TAR' ] && [ \$(fmode '$ADOPT_TAR') = 600 ]"
+check "adopt archive lists the unique session" "tar tzf '$ADOPT_TAR' | grep -q 'projects/-other-proj/u1.jsonl'"
+check "unique session merged into shared" "[ -f $HOME/.claude-shared/projects/-other-proj/u1.jsonl ] && grep -q only-in-personal $HOME/.claude-shared/projects/-other-proj/u1.jsonl"
+check "unique file-history entry merged into shared" "[ -f $HOME/.claude-shared/file-history/uniq-sess/1.json ]"
+check "unique skill merged into shared" "[ -f $HOME/.claude-shared/skills/y/SKILL.md ]"
+check "overlapping session NOT overwritten (shared copy won)" "grep -q 'hi' $HOME/.claude-shared/projects/-fake-proj/s1.jsonl && ! grep -q PROFILE-COPY $HOME/.claude-shared/projects/-fake-proj/s1.jsonl"
+check "merge reported copied and skipped separately" "grep -q 'merge  projects/: 1 copied in, 1 skipped' $T/adopt-apply.out"
+check "shared history.jsonl has exactly the 4 unique lines" "[ \$(wc -l < $HOME/.claude-shared/history.jsonl | tr -d ' ') -eq 4 ]"
+check "shared history timestamps are non-decreasing" "hist_sorted $HOME/.claude-shared/history.jsonl"
+check "history keeps the untimestamped lines first, shared one leading" "[ \"\$(sed -n 1p $HOME/.claude-shared/history.jsonl)\" = '{\"display\":\"prompt one\"}' ] && [ \"\$(sed -n 2p $HOME/.claude-shared/history.jsonl)\" = '{\"display\":\"p-no-timestamp\"}' ]"
+check "history sorted the profile's out-of-order timestamps" "[ \"\$(sed -n 3p $HOME/.claude-shared/history.jsonl)\" = '{\"display\":\"p-one\",\"timestamp\":100}' ] && [ \"\$(sed -n 4p $HOME/.claude-shared/history.jsonl)\" = '{\"display\":\"p-two\",\"timestamp\":200}' ]"
+check "every shared path in the adopted profile is now a symlink" "all_share_linked $P"
+check "adopted profile keeps its own real credentials, untouched" "[ -f $P/.credentials.json ] && [ ! -L $P/.credentials.json ] && cmp -s $P/.credentials.json $T/p-creds.before"
+check "adopted profile keeps its own real .claude.json, untouched" "[ -f $P/.claude.json ] && [ ! -L $P/.claude.json ] && cmp -s $P/.claude.json $T/p-state.before"
+check ".adopted-* dir holds the old projects tree and history" "ls -d $P/.adopted-*/projects/-other-proj/u1.jsonl >/dev/null 2>&1 && ls -d $P/.adopted-*/history.jsonl >/dev/null 2>&1"
+check "conf records the adopted profile" "grep -q '^ADOPTED=personal$' $HOME/.claude-shared/.claude-profiles.conf"
+
+bash "$SCRIPT" verify > "$T/adopt-verify.out" 2>&1; rc=$?
+check "verify after adopt exits 0" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/adopt-verify.out"
+check "verify lists the .adopted dir without calling it a problem" "grep -q '.adopted-' $T/adopt-verify.out && grep -q 'Delete it when you are happy' $T/adopt-verify.out"
+check "verify shows both accounts" "grep -q 'work: me@example.com' $T/adopt-verify.out && grep -q 'personal: work@example.com' $T/adopt-verify.out"
+
+bash "$SCRIPT" apply --adopt --yes --shell > "$T/adopt-apply2.out" 2>&1; rc=$?
+check "second apply --adopt is a no-op, exits 0" "[ $rc -eq 0 ]"
+check "second apply --adopt takes no second adopt archive" "[ \$(ls $HOME/.claude-backups/claude-personal-adopted-*.tar.gz | wc -l) -eq 1 ]"
+check "second apply --adopt leaves the merged history alone" "[ \$(wc -l < $HOME/.claude-shared/history.jsonl | tr -d ' ') -eq 4 ]"
+check "second apply --adopt keeps the ADOPTED record" "grep -q '^ADOPTED=personal$' $HOME/.claude-shared/.claude-profiles.conf"
+
+bash "$SCRIPT" rollback --yes > "$T/adopt-rollback.out" 2>&1; rc=$?
+check "rollback after adopt exits 0" "[ $rc -eq 0 ]"
+check "rollback after adopt removed both profiles and the shared dir" "[ ! -e $HOME/.claude-work ] && [ ! -e $P ] && [ ! -e $HOME/.claude-shared ]"
+check "the adopt archive survives rollback" "[ -f '$ADOPT_TAR' ]"
+
 echo "=== safe mode + custom names, verify without flags ==="
 bash "$SCRIPT" apply --yes --share safe --main corp --second home > "$T/apply-safe.out" 2>&1; rc=$?
 check "safe apply exits 0" "[ $rc -eq 0 ]"
