@@ -103,6 +103,15 @@ CONFIG_SHARED="skills commands agents workflows rules output-styles plugins"
 # Config copied once into each profile, then free to diverge.
 CONFIG_COPIED="settings.json CLAUDE.md keybindings.json themes"
 
+# With CLAUDE_CONFIG_DIR set, user-scope instructions come from the profile's
+# own CLAUDE.md, and ~/.claude/CLAUDE.md is no longer "yours": it is just the
+# .claude/CLAUDE.md of $HOME, an ancestor of every project under it, so it
+# loads as project instructions on top of the profile's copy (and, counting
+# as a project CLAUDE.md, stops a repo's AGENTS.md from loading). Every
+# profile's settings.json gets this path in claudeMdExcludes. Always $HOME's,
+# whatever --source says: that is the directory Claude Code walks up through.
+ANCESTOR_MD="${HOME}/.claude/CLAUDE.md"
+
 # Deliberately NOT shared, ever:
 #   .credentials.json  the whole point of the separation
 #   .claude.json       holds the OAuth session and per-project trust
@@ -937,10 +946,14 @@ find_old_claude_paths() {
   # shellcheck disable=SC2016
   p2='\$HOME/\.claude/'"$excl"
   p3="$home_esc"'/\.claude/'"$excl"
+  # ~/.claude/CLAUDE.md is dropped from the list: in settings.json it is the
+  # claudeMdExcludes entry (see ANCESTOR_MD), which names the file so that it
+  # is NOT read. Relocating it would silently break the exclusion, and once
+  # finalize deletes it the pattern just matches nothing.
   { grep -oE "$p1" "$file" 2>/dev/null || true
     grep -oE "$p2" "$file" 2>/dev/null || true
     grep -oE "$p3" "$file" 2>/dev/null || true
-  } | sort -u
+  } | { grep -v '/\.claude/CLAUDE\.md$' || true; } | sort -u
 }
 
 relocate_settings_scripts() {
@@ -1020,6 +1033,70 @@ relocate_settings_scripts() {
       info "rewrite ${target}: '${c}' -> '${new_path}'"
     fi
   done
+}
+
+exclude_ancestor_claude_md() {
+  # Add ANCESTOR_MD to claudeMdExcludes in the profile's own settings.json,
+  # creating the file if the profile has none. No JSON parser: the key goes
+  # in straight after the first '{'. A file that already names the path is
+  # left alone; one with a claudeMdExcludes of its own is not merged into,
+  # because editing a JSON array with awk is how files get broken. It is
+  # reported instead, and verify keeps reporting it.
+  local dir="$1" target squashed tmp
+  target="${dir}/settings.json"
+  if [ "$DRY" -eq 1 ]; then
+    # plan: nothing was copied, so look at what apply would have copied.
+    [ -f "$target" ] || target="${SOURCE}/settings.json"
+    if [ -f "$target" ] && grep -qF "\"${ANCESTOR_MD}\"" "$target"; then
+      info "keep   claudeMdExcludes (already lists ${ANCESTOR_MD})"
+    else
+      printf '%s\n' "  ${C_DIM}would run:${C_OFF} add ${ANCESTOR_MD} to claudeMdExcludes in ${dir}/settings.json"
+    fi
+    return 0
+  fi
+
+  if [ ! -f "$target" ]; then
+    printf '{\n  "claudeMdExcludes": ["%s"]\n}\n' "$ANCESTOR_MD" > "$target"
+    info "create settings.json with claudeMdExcludes: ${ANCESTOR_MD}"
+    return 0
+  fi
+  if grep -qF "\"${ANCESTOR_MD}\"" "$target"; then
+    info "keep   claudeMdExcludes (already lists ${ANCESTOR_MD})"
+    return 0
+  fi
+  if grep -qF '"claudeMdExcludes"' "$target"; then
+    warn "${target} has its own claudeMdExcludes, which does not list"
+    warn "${ANCESTOR_MD}. Add that path to the array by hand, or Claude Code"
+    warn "loads it as project instructions in every project under ${HOME}."
+    return 0
+  fi
+  squashed=$(tr -d '[:space:]' < "$target")
+  case "$squashed" in
+    "{}") printf '{\n  "claudeMdExcludes": ["%s"]\n}\n' "$ANCESTOR_MD" > "$target" ;;
+    "{"*"}")
+      tmp="$(dirname "$target")/.$(basename "$target").md.$$"
+      # ENVIRON, not -v: awk -v would interpret backslashes in the path.
+      ANCESTOR_MD="$ANCESTOR_MD" awk '
+        !done && (i = index($0, "{")) > 0 {
+          print substr($0, 1, i)
+          print "  \"claudeMdExcludes\": [\"" ENVIRON["ANCESTOR_MD"] "\"],"
+          rest = substr($0, i + 1)
+          if (rest ~ /[^[:space:]]/) print rest
+          done = 1
+          next
+        }
+        { print }
+      ' "$target" > "$tmp"
+      mv "$tmp" "$target"
+      ;;
+    *)
+      warn "${target} does not look like a JSON object; claudeMdExcludes not"
+      warn "added. Add \"claudeMdExcludes\": [\"${ANCESTOR_MD}\"] by hand."
+      return 0
+      ;;
+  esac
+  info "add    claudeMdExcludes: ${ANCESTOR_MD} (so it is not loaded as"
+  info "       project instructions in every project under ${HOME})"
 }
 
 # ------------------------------------------------------------------ adopt --
@@ -1251,6 +1328,7 @@ make_profile() {
   done
 
   relocate_settings_scripts "$dir"
+  exclude_ancestor_claude_md "$dir"
 
   if [ "$inherit" = "yes" ]; then
     if [ -f "${dir}/.credentials.json" ]; then
@@ -1495,15 +1573,10 @@ name_for_email() {
 }
 
 refs_old_profile() {
-  # Does a settings file point at absolute paths under ~/.claude ?
+  # Does a settings file point at absolute paths under ~/.claude ? Same list
+  # as find_old_claude_paths, so the claudeMdExcludes entry does not count.
   [ -f "$1" ] || return 1
-  # Literal patterns on purpose: we are looking for these exact spellings.
-  # shellcheck disable=SC2088,SC2016
-  grep -qF '~/.claude/' "$1" 2>/dev/null && return 0
-  # shellcheck disable=SC2016
-  grep -qF '$HOME/.claude/' "$1" 2>/dev/null && return 0
-  grep -qF "${HOME}/.claude/" "$1" 2>/dev/null && return 0
-  return 1
+  [ -n "$(find_old_claude_paths "$1")" ]
 }
 
 record_conf_version() {
@@ -1794,6 +1867,29 @@ do_verify() {
     problems=$((problems+1))
   else
     ok "matching (or all unset, which is the 30-day default)"
+  fi
+
+  hdr "Ancestor CLAUDE.md"
+  # See ANCESTOR_MD. Only a problem while the file exists; after finalize it
+  # is gone and the pattern, if present, matches nothing.
+  if [ -f "$ANCESTOR_MD" ]; then
+    local unexcluded=""
+    for name in $PROFILES; do
+      grep -qF "\"${ANCESTOR_MD}\"" "$(profile_dir "$name")/settings.json" 2>/dev/null \
+        || unexcluded="${unexcluded}${unexcluded:+ }${name}"
+    done
+    if [ -n "$unexcluded" ]; then
+      warn "${ANCESTOR_MD} is not in claudeMdExcludes for: ${unexcluded}"
+      warn "Those profiles load it as project instructions in every project"
+      warn "under ${HOME}, on top of their own CLAUDE.md, and it stops a repo's"
+      warn "AGENTS.md from loading. Re-run apply, or add the exact path to"
+      warn "claudeMdExcludes in that settings.json by hand."
+      problems=$((problems+1))
+    else
+      ok "every profile excludes ${ANCESTOR_MD}"
+    fi
+  else
+    ok "no ${ANCESTOR_MD}, nothing to exclude"
   fi
 
   hdr "Settings that still point at ${SOURCE}"

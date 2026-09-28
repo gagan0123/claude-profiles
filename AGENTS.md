@@ -116,7 +116,10 @@ removing the first profile, shared data left untouched), `--settings
 NAME=PATH` on `plan`, `apply` and `add` (full-replacement copy, ignored
 when the profile already has a `settings.json`), and the `status` and
 `--json` output of both `status` and `verify` (shape of the JSON object,
-same exit status as the plain form). It never reads or writes the real
+same exit status as the plain form), and the `claudeMdExcludes` entry for
+`~/.claude/CLAUDE.md` (added once, not relocated, not a `finalize` gate 4
+reference, never merged into an existing array, flagged by `verify` when
+missing). It never reads or writes the real
 `~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
@@ -143,6 +146,14 @@ if the docs move.
   every profile must agree on it. `todos/` is legacy and not written.
 - `/logout` "removes and revokes the credential", which is why the setup
   never asks anyone to log out.
+- `CLAUDE.md` and `.claude/CLAUDE.md` load from the working directory and
+  every directory above it, so with `CLAUDE_CONFIG_DIR` set,
+  `~/.claude/CLAUDE.md` loads as a project file in every project under
+  `$HOME` and, counting as a project `CLAUDE.md`, stops `AGENTS.md` from
+  loading. `claudeMdExcludes` matches absolute paths and merges across
+  settings layers; that is why every profile's `settings.json` carries the
+  path (`ANCESTOR_MD`). Verified 2026-09-28 on Claude Code 2.1.283.
+  <https://code.claude.com/docs/en/memory>
 
 ## Docs conventions
 

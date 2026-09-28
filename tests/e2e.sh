@@ -41,10 +41,15 @@ touch -t 202501010000 "$C/projects/-fake-proj/s1.jsonl"      # old mtime, must s
 ln -s /nonexistent-target "$C/skills/dangling"                 # symlink inside source
 printf 'export PATH=$PATH\n' > "$HOME/.bashrc"
 before=$(snap)
+# apply adds this to every profile's settings.json (claudeMdExcludes, see
+# ANCESTOR_MD in the script); fixtures written by hand below need it too, or
+# verify rightly flags them while the fake ~/.claude/CLAUDE.md exists.
+XMD='"claudeMdExcludes": ["'"$HOME"'/.claude/CLAUDE.md"]'
 
 echo "=== plan ==="
 bash "$SCRIPT" plan > "$T/plan.out" 2>&1; rc=$?
 check "plan exits 0" "[ $rc -eq 0 ]"
+check "plan previews the claudeMdExcludes entry" "grep -q 'would run:.*claudeMdExcludes in $HOME/.claude-work/settings.json' $T/plan.out"
 check "plan creates nothing" "[ ! -e $HOME/.claude-work ] && [ ! -e $HOME/.claude-shared ] && [ ! -e $HOME/.claude-backups ]"
 check "plan never names ~/.claude as write target" "! grep 'would run:' $T/plan.out | awk '{print \$NF}' | grep -Eq '/\.claude(/|$)'"
 
@@ -79,6 +84,10 @@ check "missing hook path left unchanged in personal settings" "grep -q '\$HOME/.
 check "work settings.json still valid JSON" "python3 -m json.tool $HOME/.claude-work/settings.json >/dev/null"
 check "personal settings.json still valid JSON" "python3 -m json.tool $HOME/.claude-personal/settings.json >/dev/null"
 check "source settings.json still references the old path" "grep -q '~/.claude/statusline.sh' $C/settings.json"
+check "work settings.json excludes ~/.claude/CLAUDE.md" "grep -qF '\"$HOME/.claude/CLAUDE.md\"' $HOME/.claude-work/settings.json && grep -q claudeMdExcludes $HOME/.claude-work/settings.json"
+check "personal settings.json excludes ~/.claude/CLAUDE.md" "grep -qF '\"$HOME/.claude/CLAUDE.md\"' $HOME/.claude-personal/settings.json"
+check "the exclude entry is not relocated into the shared dir" "[ ! -e $HOME/.claude-shared/CLAUDE.md ] && ! grep -q 'claude-shared/CLAUDE.md' $HOME/.claude-work/settings.json"
+check "source settings.json has no claudeMdExcludes added" "! grep -q claudeMdExcludes $C/settings.json"
 check "conf recorded" "grep -q '^SHARE_MODE=full' $HOME/.claude-shared/.claude-profiles.conf"
 check "snippet written" "grep -q '^claude-work()' $HOME/.claude-profiles.sh"
 check "bashrc sources snippet once" "[ \$(grep -c 'claude-profiles.sh' $HOME/.bashrc) -eq 1 ]"
@@ -135,6 +144,7 @@ check "second apply exits 0" "[ $rc -eq 0 ]"
 check "no second backup taken" "[ \$(ls $HOME/.claude-backups/*.tar.gz | wc -l) -eq $n_before ]"
 check "bashrc still sources once" "[ \$(grep -c 'claude-profiles.sh' $HOME/.bashrc) -eq 1 ]"
 check "second apply keeps existing" "grep -q 'keep   projects' $T/apply2.out"
+check "second apply does not add the exclude twice" "[ \$(grep -c 'claudeMdExcludes' $HOME/.claude-work/settings.json) -eq 1 ] && grep -q 'keep   claudeMdExcludes' $T/apply2.out"
 
 echo "=== verify (no flags; conf drives it) ==="
 bash "$SCRIPT" verify > "$T/verify1.out" 2>&1; rc=$?
@@ -148,13 +158,32 @@ printf '{}' > "$HOME/.claude-personal/.claude.json"
 printf '{"cleanupPeriodDays": 7}' > "$HOME/.claude-personal/settings.json"
 bash "$SCRIPT" verify > "$T/verify3.out" 2>&1; rc=$?
 check "verify flags mismatched cleanupPeriodDays" "[ $rc -ne 0 ] && grep -q 'These differ' $T/verify3.out"
-printf '{"cleanupPeriodDays": 3650}' > "$HOME/.claude-personal/settings.json"
+printf '{"cleanupPeriodDays": 3650, %s}' "$XMD" > "$HOME/.claude-personal/settings.json"
 rm "$HOME/.claude-work/.credentials.json"; ln -s "$HOME/.claude-personal/.credentials.json" "$HOME/.claude-work/.credentials.json"
 bash "$SCRIPT" verify > "$T/verify4.out" 2>&1; rc=$?
 check "verify flags symlinked credentials" "[ $rc -ne 0 ] && grep -q 'SYMLINK' $T/verify4.out"
 rm "$HOME/.claude-work/.credentials.json"; cp "$C/.credentials.json" "$HOME/.claude-work/.credentials.json"
 bash "$SCRIPT" verify > "$T/verify5.out" 2>&1; rc=$?
 check "verify clean after fixes" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify5.out"
+
+echo "=== claudeMdExcludes for the ancestor ~/.claude/CLAUDE.md ==="
+PS="$HOME/.claude-personal/settings.json"
+printf '{"cleanupPeriodDays": 3650}\n' > "$PS"
+bash "$SCRIPT" verify > "$T/xmd-verify1.out" 2>&1; rc=$?
+check "xmd: verify flags a profile that does not exclude it" "[ $rc -ne 0 ] && grep -q 'not in claudeMdExcludes for: personal' $T/xmd-verify1.out"
+bash "$SCRIPT" apply --yes --no-backup > "$T/xmd-apply1.out" 2>&1; rc=$?
+check "xmd: re-apply adds it to an existing settings.json" "[ $rc -eq 0 ] && grep -qF '\"$HOME/.claude/CLAUDE.md\"' $PS && grep -q '\"cleanupPeriodDays\": 3650' $PS"
+check "xmd: the edited settings.json is valid JSON" "python3 -m json.tool $PS >/dev/null"
+bash "$SCRIPT" verify > "$T/xmd-verify2.out" 2>&1; rc=$?
+check "xmd: verify clean again" "[ $rc -eq 0 ] && grep -q 'every profile excludes' $T/xmd-verify2.out"
+printf '{}\n' > "$PS"
+bash "$SCRIPT" apply --yes --no-backup > "$T/xmd-apply2.out" 2>&1; rc=$?
+check "xmd: an empty object gets the key and stays valid JSON" "[ $rc -eq 0 ] && grep -q claudeMdExcludes $PS && python3 -m json.tool $PS >/dev/null"
+printf '{"claudeMdExcludes": ["/elsewhere/CLAUDE.md"]}\n' > "$PS"
+cp "$PS" "$T/xmd-own.ref"
+bash "$SCRIPT" apply --yes --no-backup > "$T/xmd-apply3.out" 2>&1; rc=$?
+check "xmd: an existing claudeMdExcludes is reported, not merged into" "[ $rc -eq 0 ] && grep -q 'has its own claudeMdExcludes' $T/xmd-apply3.out && cmp -s $PS $T/xmd-own.ref"
+printf '{"cleanupPeriodDays": 3650, %s}' "$XMD" > "$PS"
 
 echo "=== verify: Accounts section ==="
 # At this point: work has a real copy of the source's (FAKE, not FAKE-WORK)
@@ -317,8 +346,8 @@ WORK_SETTINGS="$HOME/.claude-work/settings.json"
 PERSONAL_SETTINGS="$HOME/.claude-personal/settings.json"
 work_settings_orig=$(cat "$WORK_SETTINGS")
 personal_settings_orig=$(cat "$PERSONAL_SETTINGS")
-printf '{"cleanupPeriodDays" :  14}\n' > "$WORK_SETTINGS"
-printf '{"cleanupPeriodDays":14}\n' > "$PERSONAL_SETTINGS"
+printf '{"cleanupPeriodDays" :  14, %s}\n' "$XMD" > "$WORK_SETTINGS"
+printf '{"cleanupPeriodDays":14, %s}\n' "$XMD" > "$PERSONAL_SETTINGS"
 bash "$SCRIPT" verify > "$T/verify-cleanup-ws.out" 2>&1; rc=$?
 check "cleanupPeriodDays: differing whitespace, same value, no mismatch warning" "[ $rc -eq 0 ] && ! grep -q 'These differ' $T/verify-cleanup-ws.out"
 printf '%s\n' "$work_settings_orig" > "$WORK_SETTINGS"
@@ -721,7 +750,9 @@ mkdir -p "$HOME/.claude-work/sessions" "$HOME/.claude-personal/sessions"
 printf '{}' > "$HOME/.claude-personal/.claude.json"
 printf '{"claudeAiOauth":{"accessToken":"FAKE-WORK"}}\n' > "$HOME/.claude-personal/.credentials.json"
 chmod 600 "$HOME/.claude-personal/.credentials.json"
-FIN_SET='{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude-shared/statusline.sh"}}'
+# The claudeMdExcludes entry names a path under the source on purpose: it
+# must not count as a reference for gate 4, or finalize could never run.
+FIN_SET='{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude-shared/statusline.sh"}, '"$XMD"'}'
 printf '%s\n' "$FIN_SET" > "$HOME/.claude-work/settings.json"
 printf '%s\n' "$FIN_SET" > "$HOME/.claude-personal/settings.json"
 bash "$SCRIPT" verify > "$T/fin-verify0.out" 2>&1; rc=$?
@@ -744,7 +775,7 @@ check "finalize: source survives the sessions refusal" "[ -d $HOME/.claude ]"
 rm -f "$HOME/.claude/sessions/live.json"
 
 # Gate 4: a settings.json still pointing into the source.
-printf '{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude/statusline.sh"}}\n' > "$HOME/.claude-personal/settings.json"
+printf '{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude/statusline.sh"}, %s}\n' "$XMD" > "$HOME/.claude-personal/settings.json"
 bash "$SCRIPT" finalize --yes > "$T/fin-refs.out" 2>&1; rc=$?
 check "finalize refuses while a profile settings.json points into the source" "[ $rc -ne 0 ] && grep -qF '$HOME/.claude-personal/settings.json' $T/fin-refs.out"
 check "finalize: source survives the settings refusal" "[ -d $HOME/.claude ]"

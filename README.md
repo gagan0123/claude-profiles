@@ -223,7 +223,8 @@ at a single shared location.
                          already logged in; on macOS the Keychain holds it
   .claude.json           real file, copied from ~/.claude.json: onboarding
                          done, project trust, user-scope MCP servers
-  settings.json          real file, copied from ~/.claude at setup
+  settings.json          real file, copied from ~/.claude at setup, plus a
+                         claudeMdExcludes entry for ~/.claude/CLAUDE.md
   CLAUDE.md              real file, copied from ~/.claude at setup
   projects   ──┐         symlink
   history.jsonl┤         symlink
@@ -457,6 +458,26 @@ it could not relocate this way -- normally a script that did not exist
 under `~/.claude` at apply time, or was added since. Re-run `apply` (safe
 to repeat) or fix the path in `settings.json` by hand.
 
+**`~/.claude/CLAUDE.md` would otherwise load in every project, as project
+instructions.** With `CLAUDE_CONFIG_DIR` set, your user-level instructions
+come from the profile's own `CLAUDE.md`. The old `~/.claude/CLAUDE.md` is
+then no longer your user file, just a `.claude/CLAUDE.md` in `$HOME`, and
+the memory docs say Claude Code "loads `CLAUDE.md` and `CLAUDE.local.md`
+from your current working directory and every directory above it", which
+includes `./.claude/CLAUDE.md`. So in any project under your home directory
+the old file loads on top of the profile's copy: the same instructions
+twice while the two are identical, stale ones once they drift. It also
+counts as a project `CLAUDE.md`, and by default a repository's `AGENTS.md`
+is only read when there is none "in your working directory or above it", so
+`AGENTS.md` silently stops loading. `apply` and `add` therefore add the
+absolute path to `claudeMdExcludes` in each profile's own `settings.json`
+(creating the file if the profile has none; `~/.claude` itself is never
+touched). A profile that already has its own `claudeMdExcludes` is not
+edited: add the path to that array by hand. `verify` checks every profile
+while the file exists. The entry names a path under `~/.claude` on purpose,
+so it is not relocated and does not count as a reference that blocks
+`finalize`; after `finalize` it matches nothing and is harmless.
+
 **IDE extensions do not know about profiles.** The VS Code and JetBrains
 extensions launch and discover Claude Code without your shell functions, so
 they use `~/.claude` (the old profile) unless `CLAUDE_CONFIG_DIR` is set in
@@ -688,6 +709,7 @@ former.
 - [Environment variables](https://code.claude.com/docs/en/env-vars)
 - [Authentication, "Credential management"](https://code.claude.com/docs/en/authentication#credential-management) — per-platform credential storage, and the statement that `CLAUDE_CONFIG_DIR` keys both the credentials file and the macOS Keychain entry
 - [Retention (`cleanupPeriodDays`)](https://code.claude.com/docs/en/claude-directory) — which paths the age sweep deletes; note it covers `plans/` and `paste-cache/`, which are shared in both modes
+- [Manage Claude's memory](https://code.claude.com/docs/en/memory) — CLAUDE.md is loaded from every directory above the working directory, `claudeMdExcludes` skips files by absolute path or glob, and when `AGENTS.md` is read instead of `CLAUDE.md`
 - [Issue #33430](https://github.com/anthropics/claude-code/issues/33430) — `CLAUDE_CONFIG_DIR` is undocumented; track it for changes
 
 ---

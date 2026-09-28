@@ -158,7 +158,16 @@ The "Settings that still point at ~/.claude" section is informational:
 `~/.claude` into `~/.claude-shared` and repoints the setting, so a
 reference this section still flags means that script did not exist under
 `~/.claude` at apply time (or was added since). Tell the user to re-run
-`apply` (safe to repeat) or repoint the setting by hand.
+`apply` (safe to repeat) or repoint the setting by hand. The
+`claudeMdExcludes` entry naming `~/.claude/CLAUDE.md` is deliberately not
+counted as such a reference.
+
+If the "Ancestor CLAUDE.md" section warns, a profile's `settings.json` does
+not list `~/.claude/CLAUDE.md` in `claudeMdExcludes`, so that file loads as
+project instructions in every project under the home directory. Re-run
+`apply`, which adds it; if the warning stays because the profile already
+had its own `claudeMdExcludes`, tell the user to add the exact path that
+the warning prints to that array by hand.
 
 Quote the "Accounts" section back to the user: it names which email each
 launched profile is actually logged in as, which is the only real proof that
