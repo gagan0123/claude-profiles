@@ -88,7 +88,16 @@ macOS, and the **BSD userland**, because that is what macOS ships. Concretely:
 - The launcher snippet is sourced by **both bash and zsh**. Function names
   with hyphens (`claude-work`) are fine in both; keep the body POSIX-ish.
 
-Run `shellcheck -s bash` on both scripts before committing. The
+`statusline.sh` follows the same bash 3.2 and BSD rules; it is installed
+on macOS and runs from `/bin/bash` there. It is the one place that needs
+`jq`, and so is the `statusline` command, which uses jq to edit
+`settings.json` because `statusLine` is a nested object that an awk edit
+would get wrong. Nothing else in `claude-profiles.sh` may depend on jq:
+`plan`, `apply` and the rest must keep working without it. `apply` must
+never install the status line; it is opt-in.
+
+Run `shellcheck -s bash` on `claude-profiles.sh`, `statusline.sh` and
+`tests/e2e.sh` before committing. The
 `# shellcheck disable=` comments in `claude-profiles.sh` cover literal
 strings that must contain `~` and `$HOME` unexpanded, and awk programs held
 in variables; do not add more without a comment saying why.
@@ -119,7 +128,13 @@ when the profile already has a `settings.json`), and the `status` and
 same exit status as the plain form), and the `claudeMdExcludes` entry for
 `~/.claude/CLAUDE.md` (added once, not relocated, not a `finalize` gate 4
 reference, never merged into an existing array, flagged by `verify` when
-missing). It never reads or writes the real
+missing), and the `statusline` command (refused before `apply` and without
+a terminal, never installed by `apply`, a user's own `statusLine` left
+alone without `--replace` and backed up with it, re-run idempotent and
+updating a stale copy, `--remove`) plus `statusline.sh` itself fed JSON:
+profile name, Remote Control from a fake session file, warning marks, PR
+link, narrow widths, `NO_COLOR`, and malformed or hostile input. The
+statusline checks are skipped when jq is not installed. It never reads or writes the real
 `~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you

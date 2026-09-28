@@ -861,6 +861,90 @@ printf '{"cleanupPeriodDays": 30}\n' > "$H9/.claude/settings.json"
 HOME="$H9" bash "$SCRIPT" status > "$T/status-noconf.out" 2>&1; rc=$?
 check "status with no conf exits non-zero" "[ $rc -ne 0 ]"
 
+echo "=== statusline (opt-in command and the script itself) ==="
+# A fake HOME of its own. work inherits the source's settings.json, whose
+# statusLine apply relocates to ~/.claude-shared/statusline.sh: a status line
+# of the user's own, which the command must not take over without --replace.
+# personal is seeded with --settings and has no statusLine at all.
+SLS="$(dirname "$SCRIPT")/statusline.sh"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP statusline checks (jq is not installed)"
+else
+H10="$T/home_statusline"
+mkdir -p "$H10/.claude/sessions"
+printf '#!/bin/sh\necho mine\n' > "$H10/.claude/statusline.sh"; chmod +x "$H10/.claude/statusline.sh"
+printf '{"cleanupPeriodDays": 3650, "statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}, "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}}\n' > "$H10/.claude/settings.json"
+printf '# md\n' > "$H10/.claude/CLAUDE.md"
+printf 'export PATH=$PATH\n' > "$H10/.bashrc"
+printf '{"claudeAiOauth":{"accessToken":"FAKE"}}\n' > "$H10/.claude/.credentials.json"
+printf '{"cleanupPeriodDays": 3650}\n' > "$T/sl-personal.json"
+HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-noconf.out" 2>&1; rc=$?
+check "statusline: refuses before apply" "[ $rc -ne 0 ] && grep -q 'Run apply first' $T/sl-noconf.out"
+HOME="$H10" bash "$SCRIPT" apply --yes --shell --settings personal="$T/sl-personal.json" > "$T/sl-apply.out" 2>&1
+check "statusline: apply never installs it" "[ ! -e $H10/.claude-shared/claude-profiles-statusline.sh ] && ! grep -q claude-profiles-statusline $H10/.claude-work/settings.json $H10/.claude-personal/settings.json"
+sl_before=$(cd "$H10" && find .claude -exec ls -ld {} + | sort | cksum)
+HOME="$H10" bash "$SCRIPT" statusline > "$T/sl-notty.out" 2>&1 </dev/null; rc=$?
+check "statusline: no tty and no --yes aborts and installs nothing" "[ $rc -ne 0 ] && [ ! -e $H10/.claude-shared/claude-profiles-statusline.sh ]"
+HOME="$H10" bash "$SCRIPT" statusline --replace-all > /dev/null 2>&1; rc=$?
+check "statusline: unknown option rejected" "[ $rc -ne 0 ]"
+HOME="$H10" bash "$SCRIPT" verify --replace > /dev/null 2>&1; rc=$?
+check "statusline: --replace rejected on other commands" "[ $rc -ne 0 ]"
+cp "$H10/.claude-work/settings.json" "$T/sl-work-before.json"
+HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-install.out" 2>&1; rc=$?
+check "statusline: install exits 0" "[ $rc -eq 0 ]"
+check "statusline: script installed, mode 755, same as the repo copy" "[ \$(fmode $H10/.claude-shared/claude-profiles-statusline.sh) = 755 ] && cmp -s $SLS $H10/.claude-shared/claude-profiles-statusline.sh"
+check "statusline: profile without a statusLine now points at it" "[ \"\$(jq -r .statusLine.command $H10/.claude-personal/settings.json)\" = '~/.claude-shared/claude-profiles-statusline.sh' ]"
+check "statusline: other settings kept" "[ \"\$(jq -r .cleanupPeriodDays $H10/.claude-personal/settings.json)\" = 3650 ] && jq -e '.claudeMdExcludes | length == 1' $H10/.claude-personal/settings.json >/dev/null"
+check "statusline: a profile with its own statusLine is left alone and named" "cmp -s $H10/.claude-work/settings.json $T/sl-work-before.json && grep -q 'work: .*already has a statusLine' $T/sl-install.out && grep -q -- '--replace' $T/sl-install.out"
+HOME="$H10" bash "$SCRIPT" statusline --yes --replace > "$T/sl-replace.out" 2>&1; rc=$?
+check "statusline: --replace takes it over" "[ $rc -eq 0 ] && [ \"\$(jq -r .statusLine.command $H10/.claude-work/settings.json)\" = '~/.claude-shared/claude-profiles-statusline.sh' ]"
+check "statusline: --replace kept a copy of the old settings.json" "grep -q 'statusline.sh' \$(ls $H10/.claude-work/settings.json.pre-statusline-* | head -n 1) && ! grep -q claude-profiles-statusline \$(ls $H10/.claude-work/settings.json.pre-statusline-* | head -n 1)"
+check "statusline: --replace left the hooks alone" "[ \"\$(jq -r '.hooks.Stop[0].hooks[0].command' $H10/.claude-work/settings.json)\" = true ]"
+sl_after=$(cd "$H10" && find .claude -exec ls -ld {} + | sort | cksum)
+check "statusline: source profile untouched" "[ '$sl_before' = '$sl_after' ]"
+HOME="$H10" bash "$SCRIPT" verify > "$T/sl-verify.out" 2>&1; rc=$?
+check "statusline: verify clean with it installed" "[ $rc -eq 0 ]"
+HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-again.out" 2>&1; rc=$?
+check "statusline: re-run is a no-op" "[ $rc -eq 0 ] && [ \$(grep -c 'already uses it' $T/sl-again.out) -eq 2 ] && grep -q 'keep   ' $T/sl-again.out"
+printf '# stale\n' >> "$H10/.claude-shared/claude-profiles-statusline.sh"
+HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-update.out" 2>&1; rc=$?
+check "statusline: re-run updates a stale installed copy" "[ $rc -eq 0 ] && grep -q 'update ' $T/sl-update.out && cmp -s $SLS $H10/.claude-shared/claude-profiles-statusline.sh"
+HOME="$H10" bash "$SCRIPT" statusline --yes --remove > "$T/sl-remove.out" 2>&1; rc=$?
+check "statusline: --remove takes statusLine out of both profiles" "[ $rc -eq 0 ] && ! jq -e 'has(\"statusLine\")' $H10/.claude-work/settings.json >/dev/null && ! jq -e 'has(\"statusLine\")' $H10/.claude-personal/settings.json >/dev/null"
+check "statusline: --remove deletes the script and points at the old copy" "[ ! -e $H10/.claude-shared/claude-profiles-statusline.sh ] && grep -q 'pre-statusline-' $T/sl-remove.out"
+check "statusline: --remove keeps the rest of settings.json" "[ \"\$(jq -r .cleanupPeriodDays $H10/.claude-work/settings.json)\" = 3650 ]"
+
+# The script itself, fed JSON the way Claude Code does.
+strip_sgr() { sed "s/$(printf '\033')\[[0-9;]*m//g"; }
+mkdir -p "$T/slcfg/.claude-acme/sessions"
+printf '{"pid":1,"sessionId":"s-on","bridgeSessionId":"session_x"}\n' > "$T/slcfg/.claude-acme/sessions/1.json"
+printf '{"pid":2,"sessionId":"s-off"}\n' > "$T/slcfg/.claude-acme/sessions/2.json"
+SLJ='{"model":{"display_name":"Opus"},"workspace":{"current_dir":"/nonexistent/proj"},"cost":{"total_cost_usd":1.25},"context_window":{"used_percentage":95.5},"rate_limits":{"five_hour":{"used_percentage":20,"resets_at":1}},"session_id":"s-on","session_name":"my session","pr":{"number":12,"url":"https://example.com/pr/12"}}'
+printf '%s' "$SLJ" > "$T/sl-in.json"
+out=$(CLAUDE_CONFIG_DIR="$T/slcfg/.claude-acme" bash "$SLS" < "$T/sl-in.json" 2>"$T/sl-err.out" | strip_sgr)
+check "statusline.sh: names the profile from CLAUDE_CONFIG_DIR" "printf '%s' \"$out\" | grep -q ' acme '"
+check "statusline.sh: Remote Control online from the session file" "printf '%s' \"$out\" | grep -q 'acme 📡'"
+check "statusline.sh: context at 95% is marked" "printf '%s' \"$out\" | grep -q '!95%'"
+check "statusline.sh: cost, 5h window and session name shown when wide" "printf '%s' \"\$out\" | grep -qF '\$1.25' && printf '%s' \"\$out\" | grep -q '5h 80% left' && printf '%s' \"\$out\" | grep -q 'my session'"
+check "statusline.sh: PR number is an OSC 8 link to the PR" "CLAUDE_CONFIG_DIR=$T/slcfg/.claude-acme bash $SLS < $T/sl-in.json | grep -qF ']8;;https://example.com/pr/12'"
+check "statusline.sh: nothing on stderr" "[ ! -s $T/sl-err.out ]"
+out=$(printf '%s' "$SLJ" | sed 's/s-on/s-off/' | CLAUDE_CONFIG_DIR="$T/slcfg/.claude-acme" bash "$SLS" | strip_sgr)
+check "statusline.sh: Remote Control offline without a bridge session" "printf '%s' \"$out\" | grep -q 'acme 📴'"
+out=$(printf '%s' "$SLJ" | env -u CLAUDE_CONFIG_DIR bash "$SLS" | strip_sgr)
+check "statusline.sh: no CLAUDE_CONFIG_DIR is the default profile" "printf '%s' \"$out\" | grep -q ' default '"
+# Read only inside the check's eval string, which shellcheck cannot see.
+# shellcheck disable=SC2034
+narrow=$(printf '%s' "$SLJ" | COLUMNS=60 CLAUDE_CONFIG_DIR="$T/slcfg/.claude-acme" bash "$SLS" | strip_sgr)
+check "statusline.sh: a narrow terminal drops the session name and bar, keeps the essentials" "! printf '%s' \"\$narrow\" | grep -q 'my session' && ! printf '%s' \"\$narrow\" | grep -q '░' && printf '%s' \"\$narrow\" | grep -q 'acme' && printf '%s' \"\$narrow\" | grep -qF '\$1.25' && printf '%s' \"\$narrow\" | grep -q '5h 80%'"
+check "statusline.sh: NO_COLOR means no colour codes" "! NO_COLOR=1 bash $SLS < $T/sl-in.json | grep -q \"$(printf '\033')\\[\""
+for bad in 'not json' '' '[1,2]' '{"model":"x","context_window":{"used_percentage":"lots"},"pr":{"number":"7","url":"javascript:x"}}'; do
+  out=$(printf '%s' "$bad" | bash "$SLS" 2>"$T/sl-bad.err")
+  check "statusline.sh: bad input '$(printf '%.10s' "$bad")' still prints a line, no stderr" "[ -n \"\$(printf '%s' \"$out\" | head -c 1)\" ] && [ ! -s $T/sl-bad.err ]"
+done
+out=$(printf '{"model":{"display_name":"A\\u001b]0;x\\u0007B"},"session_name":"n\\u001b[31m"}' | bash "$SLS")
+check "statusline.sh: escape sequences in input never reach the terminal" "! printf '%s' \"$out\" | grep -q \"$(printf '\007')\" && ! printf '%s' \"$out\" | grep -q \"$(printf '\033')]0\""
+fi
+
 echo
 echo "passed=$pass failed=$fail   (outputs in $T)"
 [ "$fail" -eq 0 ]

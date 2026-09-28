@@ -53,6 +53,8 @@ DO_BACKUP=1
 ASSUME_YES=0
 ADOPT=0
 CMD=""
+SL_REPLACE=0
+SL_REMOVE=0
 JSON=0
 JSON_FILE=""
 VERIFY_PROBLEMS=0
@@ -351,6 +353,12 @@ Commands:
   finalize    Delete the source profile (${SOURCE}) once the new setup has
               replaced it. IRREVERSIBLE: the only way back is the tar
               archive it takes first. Runs eight gates and asks to confirm.
+  statusline  Optional, never run by apply: install this repo's status line
+              (profile name, Remote Control, branch and PR, context, cost,
+              5h/7d quota) into ${SHARED} and point every profile's
+              settings.json at it. Needs jq. A profile that already has a
+              statusLine of its own is left alone unless --replace is given.
+              Re-run it to pick up a newer statusline.sh; --remove undoes it.
 
 Options:
   --profiles LIST   comma-separated profile names, at least two, e.g.
@@ -400,6 +408,13 @@ Options:
                     is then required instead of a fresh one.
   --yes             skip confirmation prompts. REQUIRED when there is no
                     terminal to answer them, e.g. when run from Claude Code.
+  --replace         with 'statusline': also take over profiles whose
+                    settings.json already has a different statusLine. Each
+                    such file is copied to settings.json.pre-statusline-<stamp>
+                    first.
+  --remove          with 'statusline': remove the statusLine setting from
+                    every profile that points at this status line, then
+                    delete the installed script.
   --json            with 'status' or 'verify', print one JSON object to
                     stdout instead of the human-readable report. No colour,
                     no other output. Exit status is unchanged.
@@ -419,6 +434,7 @@ Examples:
   ./claude-profiles.sh apply --profiles work,personal,clientx --shell
   ./claude-profiles.sh verify
   ./claude-profiles.sh finalize      # weeks later, when you trust the setup
+  ./claude-profiles.sh statusline    # optional, only if you want it
 EOF
 }
 
@@ -427,7 +443,7 @@ EOF
 [ $# -eq 0 ] && { usage; exit 0; }
 
 case "${1:-}" in
-  plan|apply|status|verify|rollback|finalize) CMD="$1"; shift ;;
+  plan|apply|status|verify|rollback|finalize|statusline) CMD="$1"; shift ;;
   add|remove)
     # These two take a positional the option loop below would reject as an
     # unknown option: `add NAME[,NAME...]`, `remove NAME`.
@@ -474,6 +490,10 @@ while [ $# -gt 0 ]; do
     --adopt)  ADOPT=1; shift ;;
     --no-backup) DO_BACKUP=0; shift ;;
     --yes)    ASSUME_YES=1; shift ;;
+    --replace|--remove)
+      [ "$CMD" = "statusline" ] || die "${1} is only accepted by statusline, not '${CMD}'."
+      if [ "$1" = "--replace" ]; then SL_REPLACE=1; else SL_REMOVE=1; fi
+      shift ;;
     --json)   JSON=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option '${1}'. Try --help." ;;
@@ -2784,6 +2804,187 @@ do_finalize() {
   say "  only rollback level that can restore the old profile."
 }
 
+# ------------------------------------------------------------- status line --
+#
+# Optional and opt-in: apply never installs it. `statusline` copies the
+# statusline.sh that sits next to this script into ${SHARED} and sets
+# statusLine in each profile's own settings.json. The source profile is never
+# edited. These edits go through jq, not awk: statusLine is a nested object,
+# and replacing one in a file that may also hold hook objects with their own
+# "command" keys is exactly what a text edit gets wrong. The status line
+# itself needs jq anyway, so the command requires it and the rest of the
+# script still does not.
+
+SL_NAME="claude-profiles-statusline.sh"
+# A jq program, not shell: $c is jq's --arg, and must reach jq unexpanded.
+# shellcheck disable=SC2016
+SL_SET='.statusLine = {"type": "command", "command": $c}'
+# shellcheck disable=SC2088
+SL_CMD="~/.claude-shared/${SL_NAME}"
+
+script_dir() {
+  # The directory this script lives in, following one level of symlink (the
+  # usual ~/.local/bin/claude-profiles.sh -> checkout case). No readlink -f.
+  local src="$0" link
+  if [ -L "$src" ]; then
+    link=$(readlink "$src")
+    case "$link" in
+      /*) src="$link" ;;
+      *)  src="$(dirname "$src")/${link}" ;;
+    esac
+  fi
+  (cd "$(dirname "$src")" && pwd -P)
+}
+
+sl_state() {
+  # $1 = a profile's settings.json. Prints one word: missing, none, ours,
+  # other, or invalid (not JSON jq can read).
+  local f="$1" cmd
+  [ -f "$f" ] || { printf 'missing'; return 0; }
+  if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    printf 'invalid'; return 0
+  fi
+  cmd=$(jq -r 'if (.statusLine | type) == "object" then (.statusLine.command // "") else "" end' "$f" 2>/dev/null)
+  if ! jq -e 'has("statusLine")' "$f" >/dev/null 2>&1; then printf 'none'
+  elif [ "$cmd" = "$SL_CMD" ] || [ "$cmd" = "${SHARED}/${SL_NAME}" ]; then printf 'ours'
+  else printf 'other'; fi
+}
+
+sl_edit() {
+  # $1 = settings.json, $2 = jq program. Writes through a temp file made with
+  # cp -p, so the mode survives, then renames: an interrupted edit leaves the
+  # old file, never half a file.
+  local f="$1" prog="$2" tmp
+  tmp="$(dirname "$f")/.$(basename "$f").sl.$$"
+  cp -p "$f" "$tmp"
+  if jq --arg c "$SL_CMD" "$prog" "$f" > "$tmp"; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+do_statusline() {
+  local src dest name dir f st todo=0 skipped=0 bak
+  dest="${SHARED}/${SL_NAME}"
+
+  [ "$CONF_LOADED" -eq 1 ] && [ -d "$SHARED" ] \
+    || die "no setup found (${CONF_FILE} is missing). Run apply first."
+  command -v jq >/dev/null 2>&1 \
+    || die "the status line needs jq, and so does this command's settings.json
+       edit. Install jq (brew install jq / apt install jq) and re-run."
+
+  if [ "$SL_REMOVE" -eq 1 ]; then
+    hdr "Status line: remove"
+    for name in $PROFILES; do
+      f="$(profile_dir "$name")/settings.json"
+      if [ "$(sl_state "$f")" = "ours" ]; then
+        info "${name}: remove statusLine from ${f}"
+        todo=$((todo+1))
+      else
+        info "${name}: not using this status line, left alone"
+      fi
+    done
+    [ -e "$dest" ] && info "delete ${dest}"
+    if [ "$todo" -eq 0 ] && [ ! -e "$dest" ]; then
+      ok "nothing to remove"
+      return 0
+    fi
+    confirm "Remove it?" || { say "aborted"; exit 1; }
+    for name in $PROFILES; do
+      f="$(profile_dir "$name")/settings.json"
+      [ "$(sl_state "$f")" = "ours" ] || continue
+      sl_edit "$f" 'del(.statusLine)' || die "could not edit ${f}; it is unchanged."
+      ok "${name}: statusLine removed"
+      bak=""
+      for st in "${f}".pre-statusline-*; do [ -e "$st" ] && bak="$st"; done
+      if [ -n "$bak" ]; then
+        info "  the statusLine it had before is in ${bak}; copy it back by hand"
+        info "  if you want that one again"
+      fi
+    done
+    [ -e "$dest" ] && { rm -f "$dest"; ok "deleted ${dest}"; }
+    return 0
+  fi
+
+  src="$(script_dir)/statusline.sh"
+  [ -f "$src" ] || die "statusline.sh is not next to this script (looked for ${src}).
+       Run the command from a checkout or release tarball of claude-profiles,
+       where the two files ship together."
+
+  hdr "Status line: install"
+  if [ ! -e "$dest" ]; then
+    info "copy   ${src} -> ${dest}"
+  elif cmp -s "$src" "$dest"; then
+    info "keep   ${dest} (same as ${src})"
+  else
+    info "update ${dest} <- ${src}"
+  fi
+  for name in $PROFILES; do
+    f="$(profile_dir "$name")/settings.json"
+    st=$(sl_state "$f")
+    case "$st" in
+      ours)    info "${name}: already uses it" ;;
+      missing) info "${name}: create ${f} with statusLine"; todo=$((todo+1)) ;;
+      none)    info "${name}: add statusLine to ${f}"; todo=$((todo+1)) ;;
+      other)
+        if [ "$SL_REPLACE" -eq 1 ]; then
+          info "${name}: replace statusLine in ${f} (was: $(jq -r '.statusLine.command? // .statusLine' "$f" 2>/dev/null))"
+          info "        a copy goes to ${f}.pre-statusline-${RUN_STAMP} first"
+          todo=$((todo+1))
+        else
+          warn "${name}: ${f} already has a statusLine of its own:"
+          warn "        $(jq -r '.statusLine.command? // .statusLine' "$f" 2>/dev/null)"
+          warn "        Left alone. Re-run with --replace to take it over."
+          skipped=$((skipped+1))
+        fi ;;
+      invalid)
+        warn "${name}: ${f} is not a JSON object jq can read. Left alone."
+        skipped=$((skipped+1)) ;;
+    esac
+  done
+  info "jq rewrites each edited settings.json with its own formatting; keys"
+  info "and values are unchanged apart from statusLine."
+
+  confirm "Install the status line?" || { say "aborted"; exit 1; }
+
+  if [ ! -e "$dest" ] || ! cmp -s "$src" "$dest"; then
+    cp "$src" "${dest}.partial.$$"
+    chmod 755 "${dest}.partial.$$"
+    mv "${dest}.partial.$$" "$dest"
+    ok "installed ${dest}"
+  fi
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    f="${dir}/settings.json"
+    st=$(sl_state "$f")
+    case "$st" in
+      missing)
+        [ -d "$dir" ] || { warn "${name}: ${dir} does not exist, skipped"; continue; }
+        printf '{\n  "statusLine": {"type": "command", "command": "%s"}\n}\n' "$SL_CMD" > "$f"
+        ok "${name}: created ${f}" ;;
+      none)
+        sl_edit "$f" "$SL_SET" \
+          || die "could not edit ${f}; it is unchanged."
+        ok "${name}: statusLine set" ;;
+      other)
+        [ "$SL_REPLACE" -eq 1 ] || continue
+        cp -p "$f" "${f}.pre-statusline-${RUN_STAMP}"
+        sl_edit "$f" "$SL_SET" \
+          || die "could not edit ${f}; it is unchanged (copy at ${f}.pre-statusline-${RUN_STAMP})."
+        ok "${name}: statusLine replaced" ;;
+    esac
+  done
+  if [ "$skipped" -gt 0 ]; then
+    warn "${skipped} profile(s) left on their own status line (see above)."
+  fi
+  say ""
+  say "  Running sessions pick it up on their next status line refresh. It"
+  say "  needs jq at run time too. Profiles you add later do not get it"
+  say "  automatically: re-run  ./claude-profiles.sh statusline  after add."
+}
+
 # -------------------------------------------------------------------- main --
 
 banner() {
@@ -2903,5 +3104,10 @@ case "$CMD" in
     DRY=0
     banner
     do_finalize
+    ;;
+  statusline)
+    DRY=0
+    banner
+    do_statusline
     ;;
 esac

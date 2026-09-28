@@ -98,6 +98,22 @@ plain `claude` works again, using `~/.claude` exactly as before the setup.
 
 ---
 
+## Undoing `statusline`
+
+```bash
+./claude-profiles.sh statusline --remove
+```
+
+Removes `statusLine` from every profile's `settings.json` that points at
+`~/.claude-shared/claude-profiles-statusline.sh` and deletes that script.
+Profiles on a status line of their own are left alone. If `--replace` took
+one over, the previous `settings.json` is still at
+`settings.json.pre-statusline-<timestamp>` next to it; copy its
+`statusLine` back by hand if you want it. Level 2 needs none of this: it
+deletes `~/.claude-shared` and the profiles, status line included.
+
+---
+
 ## Undoing `remove`
 
 `remove` archives the whole profile directory before deleting it, to

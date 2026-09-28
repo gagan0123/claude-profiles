@@ -12,7 +12,8 @@ Contents of this bundle:
 
 | File | What it is |
 |---|---|
-| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback`, `finalize`, `add`, `remove` and `status` modes. |
+| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback`, `finalize`, `add`, `remove`, `status` and `statusline` modes. |
+| `statusline.sh` | An optional Claude Code status line that shows which profile a session is in. Installed only by `./claude-profiles.sh statusline`, never by `apply`. |
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
 | `ROLLBACK.md` | How to undo, at three levels of severity. |
@@ -189,6 +190,56 @@ cp ~/.claude/settings.json .tmp/acme-settings.json
 It is ignored for a profile that already has a `settings.json` -- re-running
 `apply` never overwrites one -- is not recorded in the conf file, and does
 not support a path containing spaces.
+
+### `statusline` (optional)
+
+```bash
+./claude-profiles.sh statusline
+```
+
+Nothing else in the setup installs this; run it only if you want it. It
+copies `statusline.sh` from the checkout to
+`~/.claude-shared/claude-profiles-statusline.sh` and sets `statusLine` in
+every profile's own `settings.json` to run it. `~/.claude` is not touched.
+It needs [`jq`](https://jqlang.org), both for that edit and at run time, and
+asks for confirmation (`--yes` without a terminal). The line looks like:
+
+```
+[Opus · high] 👤 work 📡 | 📁 claude-profiles | 🌿 main #42 | ███████▎░░ 73% | $12.35 | 5h 62% left ↻ 1h6m | 7d 60% left ↻ 3d11h | session name
+```
+
+- **Profile**, from `CLAUDE_CONFIG_DIR` (`~/.claude-work` shows `work`,
+  unset shows `default`), in a colour derived from the name so each profile
+  always looks the same. To choose the colour yourself, set
+  `CLAUDE_STATUSLINE_PROFILE_COLOR` to an SGR code such as `1;34` in that
+  profile's `settings.json` `env` block.
+- **Remote Control**: 📡 when connected, 📴 when not. The JSON Claude Code
+  sends the status line has no field for it, so this reads the session's
+  own file under `<profile>/sessions/`, which gains a `bridgeSessionId`
+  while Remote Control is connected. That file is not documented and may
+  change in a later Claude Code version; if it does, this shows 📴 rather
+  than failing.
+- **Branch**, read from the directory the session is in, and the open PR's
+  number as a clickable link (OSC 8) when the branch has one, coloured by
+  review state.
+- **Context**, **5h** and **7d** go green, then yellow from 70% used, then
+  red with a `!` from 90%, so all three warn the same way before a limit
+  hits. Cost is always shown; the docs say it is estimated at list price,
+  so on a subscription it is a measure of usage, not a bill.
+- **Session name**, when there is room.
+
+On a narrow terminal it drops things, least useful first: session name,
+reset countdowns, the context bar, the icons, then the directory, the
+effort level and the branch. Model, profile, Remote Control, context %,
+cost and the quota figures always stay. Colour is off with `NO_COLOR` set.
+
+A profile that already has a `statusLine` of its own is left alone and
+named; `--replace` takes it over after copying that `settings.json` to
+`settings.json.pre-statusline-<timestamp>`. jq rewrites each file it edits
+with its own formatting. Re-run the command after pulling a newer
+checkout to update the installed copy, and after `add`, since a new
+profile does not get it automatically. `--remove` takes the setting out of
+every profile that uses it and deletes the installed script.
 
 ### `--json`
 

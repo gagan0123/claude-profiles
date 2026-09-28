@@ -35,7 +35,11 @@ and the failure modes, and you need both.
    cannot be answered from here; without `--yes` they stop with "No terminal
    is available". So `--yes` is how you pass on the user's approval, and it
    is only ever added *after* the user has approved that exact step in chat.
-7. **`remove` is destructive to that profile's own state**, even though it
+7. **Never run `statusline` unless the user asks for the status line.** It
+   is optional and not part of the setup. It edits every profile's
+   `settings.json`; `--replace` also overwrites a status line the user
+   already has, so use it only when they say to replace theirs.
+8. **`remove` is destructive to that profile's own state**, even though it
    archives the directory first: it deletes `~/.claude-<name>`, drops the
    name from `PROFILES`, and regenerates the launcher snippet. Never run it
    unless the user names that specific profile in this conversation.
