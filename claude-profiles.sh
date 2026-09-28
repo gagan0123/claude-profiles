@@ -2816,9 +2816,18 @@ do_finalize() {
 # script still does not.
 
 SL_NAME="claude-profiles-statusline.sh"
-# A jq program, not shell: $c is jq's --arg, and must reach jq unexpanded.
+# refreshInterval: Remote Control is read from a file, not from the JSON
+# Claude Code sends, and toggling it is not one of the events that re-run a
+# status line, so without a timer the icon only changes on the next message.
+# The docs' answer for "externally-sourced segments" is this field. Five
+# seconds is plenty for an icon, and the script takes tens of milliseconds.
+SL_REFRESH=5
+# jq programs, not shell: $c and $r are jq's --arg/--argjson, and must reach
+# jq unexpanded.
 # shellcheck disable=SC2016
-SL_SET='.statusLine = {"type": "command", "command": $c}'
+SL_SET='.statusLine = {"type": "command", "command": $c, "refreshInterval": $r}'
+# shellcheck disable=SC2016
+SL_ADD_REFRESH='.statusLine.refreshInterval = $r'
 # shellcheck disable=SC2088
 SL_CMD="~/.claude-shared/${SL_NAME}"
 
@@ -2838,7 +2847,8 @@ script_dir() {
 
 sl_state() {
   # $1 = a profile's settings.json. Prints one word: missing, none, ours,
-  # other, or invalid (not JSON jq can read).
+  # stale (ours, but installed before refreshInterval was set), other, or
+  # invalid (not JSON jq can read). A refreshInterval the user chose is kept.
   local f="$1" cmd
   [ -f "$f" ] || { printf 'missing'; return 0; }
   if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
@@ -2846,7 +2856,9 @@ sl_state() {
   fi
   cmd=$(jq -r 'if (.statusLine | type) == "object" then (.statusLine.command // "") else "" end' "$f" 2>/dev/null)
   if ! jq -e 'has("statusLine")' "$f" >/dev/null 2>&1; then printf 'none'
-  elif [ "$cmd" = "$SL_CMD" ] || [ "$cmd" = "${SHARED}/${SL_NAME}" ]; then printf 'ours'
+  elif [ "$cmd" = "$SL_CMD" ] || [ "$cmd" = "${SHARED}/${SL_NAME}" ]; then
+    if jq -e '.statusLine | has("refreshInterval")' "$f" >/dev/null 2>&1; then printf 'ours'
+    else printf 'stale'; fi
   else printf 'other'; fi
 }
 
@@ -2857,7 +2869,7 @@ sl_edit() {
   local f="$1" prog="$2" tmp
   tmp="$(dirname "$f")/.$(basename "$f").sl.$$"
   cp -p "$f" "$tmp"
-  if jq --arg c "$SL_CMD" "$prog" "$f" > "$tmp"; then
+  if jq --arg c "$SL_CMD" --argjson r "$SL_REFRESH" "$prog" "$f" > "$tmp"; then
     mv "$tmp" "$f"
   else
     rm -f "$tmp"
@@ -2879,7 +2891,8 @@ do_statusline() {
     hdr "Status line: remove"
     for name in $PROFILES; do
       f="$(profile_dir "$name")/settings.json"
-      if [ "$(sl_state "$f")" = "ours" ]; then
+      st=$(sl_state "$f")
+      if [ "$st" = "ours" ] || [ "$st" = "stale" ]; then
         info "${name}: remove statusLine from ${f}"
         todo=$((todo+1))
       else
@@ -2894,7 +2907,8 @@ do_statusline() {
     confirm "Remove it?" || { say "aborted"; exit 1; }
     for name in $PROFILES; do
       f="$(profile_dir "$name")/settings.json"
-      [ "$(sl_state "$f")" = "ours" ] || continue
+      st=$(sl_state "$f")
+      [ "$st" = "ours" ] || [ "$st" = "stale" ] || continue
       sl_edit "$f" 'del(.statusLine)' || die "could not edit ${f}; it is unchanged."
       ok "${name}: statusLine removed"
       bak=""
@@ -2926,6 +2940,7 @@ do_statusline() {
     st=$(sl_state "$f")
     case "$st" in
       ours)    info "${name}: already uses it" ;;
+      stale)   info "${name}: add refreshInterval ${SL_REFRESH} to its statusLine"; todo=$((todo+1)) ;;
       missing) info "${name}: create ${f} with statusLine"; todo=$((todo+1)) ;;
       none)    info "${name}: add statusLine to ${f}"; todo=$((todo+1)) ;;
       other)
@@ -2962,12 +2977,15 @@ do_statusline() {
     case "$st" in
       missing)
         [ -d "$dir" ] || { warn "${name}: ${dir} does not exist, skipped"; continue; }
-        printf '{\n  "statusLine": {"type": "command", "command": "%s"}\n}\n' "$SL_CMD" > "$f"
+        printf '{\n  "statusLine": {"type": "command", "command": "%s", "refreshInterval": %s}\n}\n' "$SL_CMD" "$SL_REFRESH" > "$f"
         ok "${name}: created ${f}" ;;
       none)
         sl_edit "$f" "$SL_SET" \
           || die "could not edit ${f}; it is unchanged."
         ok "${name}: statusLine set" ;;
+      stale)
+        sl_edit "$f" "$SL_ADD_REFRESH" || die "could not edit ${f}; it is unchanged."
+        ok "${name}: refreshInterval ${SL_REFRESH} added" ;;
       other)
         [ "$SL_REPLACE" -eq 1 ] || continue
         cp -p "$f" "${f}.pre-statusline-${RUN_STAMP}"

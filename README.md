@@ -218,7 +218,10 @@ asks for confirmation (`--yes` without a terminal). The line looks like:
   own file under `<profile>/sessions/`, which gains a `bridgeSessionId`
   while Remote Control is connected. That file is not documented and may
   change in a later Claude Code version; if it does, this shows 📴 rather
-  than failing.
+  than failing. Toggling Remote Control is not one of the events that
+  re-run a status line, so the command also sets `refreshInterval` to 5
+  seconds; without it the icon only changes on your next message. A
+  `refreshInterval` you set yourself is kept.
 - **Branch**, read from the directory the session is in, and the open PR's
   number as a clickable link (OSC 8) when the branch has one, coloured by
   review state.

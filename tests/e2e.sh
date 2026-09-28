@@ -894,6 +894,7 @@ HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-install.out" 2>&1; rc=$?
 check "statusline: install exits 0" "[ $rc -eq 0 ]"
 check "statusline: script installed, mode 755, same as the repo copy" "[ \$(fmode $H10/.claude-shared/claude-profiles-statusline.sh) = 755 ] && cmp -s $SLS $H10/.claude-shared/claude-profiles-statusline.sh"
 check "statusline: profile without a statusLine now points at it" "[ \"\$(jq -r .statusLine.command $H10/.claude-personal/settings.json)\" = '~/.claude-shared/claude-profiles-statusline.sh' ]"
+check "statusline: refreshInterval set, so Remote Control changes show without a new message" "[ \"\$(jq -r .statusLine.refreshInterval $H10/.claude-personal/settings.json)\" = 5 ]"
 check "statusline: other settings kept" "[ \"\$(jq -r .cleanupPeriodDays $H10/.claude-personal/settings.json)\" = 3650 ] && jq -e '.claudeMdExcludes | length == 1' $H10/.claude-personal/settings.json >/dev/null"
 check "statusline: a profile with its own statusLine is left alone and named" "cmp -s $H10/.claude-work/settings.json $T/sl-work-before.json && grep -q 'work: .*already has a statusLine' $T/sl-install.out && grep -q -- '--replace' $T/sl-install.out"
 HOME="$H10" bash "$SCRIPT" statusline --yes --replace > "$T/sl-replace.out" 2>&1; rc=$?
@@ -906,6 +907,13 @@ HOME="$H10" bash "$SCRIPT" verify > "$T/sl-verify.out" 2>&1; rc=$?
 check "statusline: verify clean with it installed" "[ $rc -eq 0 ]"
 HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-again.out" 2>&1; rc=$?
 check "statusline: re-run is a no-op" "[ $rc -eq 0 ] && [ \$(grep -c 'already uses it' $T/sl-again.out) -eq 2 ] && grep -q 'keep   ' $T/sl-again.out"
+# An install from before refreshInterval existed gets it added; a value the
+# user chose is kept.
+jq 'del(.statusLine.refreshInterval)' "$H10/.claude-personal/settings.json" > "$T/sl-p.json" && mv "$T/sl-p.json" "$H10/.claude-personal/settings.json"
+jq '.statusLine.refreshInterval = 30' "$H10/.claude-work/settings.json" > "$T/sl-w.json" && mv "$T/sl-w.json" "$H10/.claude-work/settings.json"
+HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-refresh.out" 2>&1; rc=$?
+check "statusline: an older install gets refreshInterval added" "[ $rc -eq 0 ] && [ \"\$(jq -r .statusLine.refreshInterval $H10/.claude-personal/settings.json)\" = 5 ] && grep -q 'refreshInterval 5 added' $T/sl-refresh.out"
+check "statusline: a refreshInterval the user chose is kept" "[ \"\$(jq -r .statusLine.refreshInterval $H10/.claude-work/settings.json)\" = 30 ]"
 printf '# stale\n' >> "$H10/.claude-shared/claude-profiles-statusline.sh"
 HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-update.out" 2>&1; rc=$?
 check "statusline: re-run updates a stale installed copy" "[ $rc -eq 0 ] && grep -q 'update ' $T/sl-update.out && cmp -s $SLS $H10/.claude-shared/claude-profiles-statusline.sh"

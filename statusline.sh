@@ -140,6 +140,8 @@ C_PROF=""
 # keeps <config dir>/sessions/<pid>.json, which carries a bridgeSessionId
 # while Remote Control is connected. That file is undocumented, so this may
 # stop working after an upgrade; it then shows offline, never an error.
+# Toggling Remote Control does not re-run the status line by itself, which
+# is why `claude-profiles.sh statusline` also sets refreshInterval.
 RC_ON=0
 if [ -n "$SESSION_ID" ] && [ -d "${CONFIG_DIR}/sessions" ]; then
   sess=$(grep -lF "\"sessionId\":\"${SESSION_ID}\"" "${CONFIG_DIR}"/sessions/*.json 2>/dev/null | head -n 1)
