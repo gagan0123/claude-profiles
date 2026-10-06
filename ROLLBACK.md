@@ -84,6 +84,15 @@ where it was. Move anything currently at that path aside first. Extract it
 *before* rollback if you want to keep working with those sessions, or
 afterwards to recover them.
 
+**In the hub layout** (README, "Hub layout") `~/.claude-shared` holds only
+links into `~/.claude`, so rollback removes the links and the shared data
+stays in `~/.claude`. Shared paths that `apply` created there empty stay too.
+If `~/.claude-shared` is itself one link to `~/.claude`, rollback refuses,
+because it resolves to the source; remove that link yourself with
+`rm ~/.claude-shared` (no `-r`, no trailing slash) and re-run rollback with
+`--profiles NAME,NAME,...`, since the conf file it read lived in `~/.claude`
+through that link and is no longer found.
+
 **Before you run this**: any conversation that happened *only* under the new
 profiles lives in `~/.claude-shared/projects/` and will be deleted. If you
 want those, copy them out first:

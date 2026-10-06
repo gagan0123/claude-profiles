@@ -984,6 +984,155 @@ out=$(printf '{"model":{"display_name":"A\\u001b]0;x\\u0007B"},"session_name":"n
 check "statusline.sh: escape sequences in input never reach the terminal" "! printf '%s' \"$out\" | grep -q \"$(printf '\007')\" && ! printf '%s' \"$out\" | grep -q \"$(printf '\033')]0\""
 fi
 
+echo "=== hub layout (Claude Desktop keeps reading ~/.claude) ==="
+# The layout a hand-edited early launcher left on a Mac: ~/.claude stays the
+# real home of the shared data because the Claude Desktop app only reads
+# ~/.claude, every entry in ~/.claude-shared is a link back into it, and each
+# profile links through ~/.claude-shared. No LAYOUT= in the conf file, since
+# nothing recorded it. Built by hand, in fake HOMEs of their own.
+HUBLIST="projects history.jsonl file-history plans skills commands agents plugins"
+mkhub() {
+  # $1 = fake HOME. ~/.claude with data, ~/.claude-shared of links into it,
+  # two profiles linking through it, and an early conf file.
+  local h="$1" c="$1/.claude" s="$1/.claude-shared" p n
+  mkdir -p "$c/projects/-hub-proj" "$c/file-history" "$c/plans" "$c/skills/x" "$c/commands" "$c/agents" "$c/plugins" "$c/sessions"
+  printf '{"type":"user","msg":"hub"}\n' > "$c/projects/-hub-proj/s1.jsonl"
+  printf '{"display":"hub prompt"}\n' > "$c/history.jsonl"
+  printf '#!/bin/sh\necho hub\n' > "$c/statusline.sh"
+  printf '{"cleanupPeriodDays": 3650}\n' > "$c/settings.json"
+  printf '{"claudeAiOauth":{"accessToken":"FAKE"}}\n' > "$c/.credentials.json"; chmod 600 "$c/.credentials.json"
+  printf '{"hasCompletedOnboarding":true}\n' > "$h/.claude.json"
+  printf 'export PATH=$PATH\n' > "$h/.bashrc"
+  mkdir -p "$s"
+  for p in $HUBLIST; do ln -s "$c/$p" "$s/$p"; done
+  printf 'MAIN=work\nSECOND=personal\nSHARE_MODE=full\n' > "$s/.claude-profiles.conf"
+  for n in work personal; do
+    mkdir -p "$h/.claude-$n"
+    for p in $HUBLIST; do ln -s "$s/$p" "$h/.claude-$n/$p"; done
+  done
+  printf '{"cleanupPeriodDays": 3650, "statusLine": {"command": "~/.claude/statusline.sh"}, "claudeMdExcludes": ["%s/.claude/CLAUDE.md"]}\n' "$h" > "$h/.claude-work/settings.json"
+  printf '{"cleanupPeriodDays": 3650, "claudeMdExcludes": ["%s/.claude/CLAUDE.md"]}\n' "$h" > "$h/.claude-personal/settings.json"
+  cp -p "$c/.credentials.json" "$h/.claude-work/.credentials.json"
+}
+# Everything that already existed in the hub: apply may add missing shared
+# paths next to it, but must not change a byte, mode or mtime of any of this.
+hubsnap() { (cd "$1" && find .claude/projects .claude/history.jsonl .claude/file-history .claude/plans .claude/skills .claude/commands .claude/agents .claude/plugins .claude/sessions .claude/settings.json .claude/statusline.sh .claude/.credentials.json .claude.json -exec ls -ld {} + | sort | cksum); }
+
+H11="$T/home_hub"
+mkhub "$H11"
+hub_before=$(hubsnap "$H11")
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-verify0.out" 2>&1; rc=$?
+check "hub: verify before re-apply fails, saying LAYOUT=hub is not recorded" "[ $rc -ne 0 ] && grep -q 'does not record LAYOUT=hub' $T/hub-verify0.out"
+check "hub: verify lists shared entries that point back into ~/.claude" "grep -qF 'projects -> $H11/.claude/projects (into $H11/.claude)' $T/hub-verify0.out"
+check "hub: banner names the hub layout" "grep -q 'layout                  : hub' $T/hub-verify0.out"
+HOME="$H11" bash "$SCRIPT" finalize --yes > "$T/hub-fin0.out" 2>&1; rc=$?
+check "hub: finalize refuses before any gate" "[ $rc -ne 0 ] && grep -q 'uses the hub layout' $T/hub-fin0.out && grep -q 'Claude Desktop app only reads' $T/hub-fin0.out && ! grep -q 'Gate 1' $T/hub-fin0.out"
+check "hub: ~/.claude survives the finalize refusal" "[ -d $H11/.claude ] && [ -f $H11/.claude.json ] && [ '$hub_before' = \"\$(hubsnap $H11)\" ]"
+HOME="$H11" bash "$SCRIPT" apply --yes --layout standard > "$T/hub-std.out" 2>&1; rc=$?
+check "hub: --layout standard on a detected hub layout is refused" "[ $rc -ne 0 ] && grep -q 'this is' $T/hub-std.out && grep -q 'a hub layout' $T/hub-std.out"
+HOME="$H11" bash "$SCRIPT" apply --yes --adopt > "$T/hub-adopt.out" 2>&1; rc=$?
+check "hub: --adopt is refused on the hub layout" "[ $rc -ne 0 ] && grep -q 'not supported with the hub layout' $T/hub-adopt.out"
+
+# What an apply of v2.2.0 left behind on that machine: a real empty
+# directory in ~/.claude-shared for each path the hub did not have, linked
+# from the profiles, and since then one of them written into.
+mkdir "$H11/.claude-shared/rules" "$H11/.claude-shared/uploads"
+printf 'x\n' > "$H11/.claude-shared/uploads/u1"
+ln -s "$H11/.claude-shared/rules" "$H11/.claude-work/rules"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-verify1.out" 2>&1; rc=$?
+check "hub: verify flags an empty real copy in ~/.claude-shared" "[ $rc -ne 0 ] && grep -qF 'real copy, not a link into $H11/.claude: $H11/.claude-shared/rules (empty: apply relinks it)' $T/hub-verify1.out"
+check "hub: verify flags a real copy holding data, and says to merge by hand" "grep -qF '$H11/.claude-shared/uploads (holds data: merge by hand)' $T/hub-verify1.out"
+
+HOME="$H11" bash "$SCRIPT" plan > "$T/hub-plan.out" 2>&1; rc=$?
+check "hub: plan exits 0 and reports the detected layout" "[ $rc -eq 0 ] && grep -q 'hub layout detected' $T/hub-plan.out"
+check "hub: plan changes nothing" "[ ! -e $H11/.claude/tasks ] && [ -d $H11/.claude-shared/rules ] && [ ! -L $H11/.claude-shared/rules ] && [ ! -e $H11/.claude-shared/tasks ] && [ '$hub_before' = \"\$(hubsnap $H11)\" ]"
+check "hub: plan copies nothing out of ~/.claude" "! grep 'would run:' $T/hub-plan.out | grep -q 'cp -Rp'"
+
+HOME="$H11" bash "$SCRIPT" apply --yes --shell > "$T/hub-apply.out" 2>&1; rc=$?
+check "hub: apply exits 0" "[ $rc -eq 0 ]"
+check "hub: everything already in ~/.claude is byte-identical after apply" "[ '$hub_before' = \"\$(hubsnap $H11)\" ]"
+check "hub: existing links kept, still resolving into ~/.claude" "[ \"\$(readlink $H11/.claude-shared/projects)\" = $H11/.claude/projects ] && [ -f $H11/.claude-work/projects/-hub-proj/s1.jsonl ]"
+check "hub: a path missing everywhere is created empty in ~/.claude and linked, not copied" "[ -d $H11/.claude/tasks ] && [ ! -L $H11/.claude/tasks ] && [ \"\$(readlink $H11/.claude-shared/tasks)\" = $H11/.claude/tasks ] && [ \"\$(readlink $H11/.claude-personal/tasks)\" = $H11/.claude-shared/tasks ]"
+check "hub: the empty real copy is replaced by a link into ~/.claude" "[ \"\$(readlink $H11/.claude-shared/rules)\" = $H11/.claude/rules ] && [ -d $H11/.claude/rules ]"
+check "hub: the real copy holding data is left exactly where it was" "[ -d $H11/.claude-shared/uploads ] && [ ! -L $H11/.claude-shared/uploads ] && [ -f $H11/.claude-shared/uploads/u1 ] && grep -q 'merging it is a manual step' $T/hub-apply.out"
+check "hub: settings paths into ~/.claude are kept, not relocated" "grep -q '~/.claude/statusline.sh' $H11/.claude-work/settings.json && [ ! -e $H11/.claude-shared/statusline.sh ]"
+check "hub: conf records LAYOUT=hub" "grep -q '^LAYOUT=hub' $H11/.claude-shared/.claude-profiles.conf"
+check "hub: next steps say never to delete ~/.claude, and do not offer finalize" "grep -q 'Never delete it' $T/hub-apply.out && ! grep -q '\./claude-profiles.sh finalize\$' $T/hub-apply.out"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-verify2.out" 2>&1; rc=$?
+check "hub: verify still flags the real copy holding data" "[ $rc -ne 0 ] && grep -q 'holds data: merge by hand' $T/hub-verify2.out && ! grep -q 'does not record LAYOUT=hub' $T/hub-verify2.out"
+# The README's manual merge, run as written (sessions quit, HOME is fake).
+(export HOME="$H11"; mv ~/.claude-shared/uploads ~/.claude-shared/.uploads.pre-hub && mkdir -p ~/.claude/uploads && cp -Rpn ~/.claude-shared/.uploads.pre-hub/. ~/.claude/uploads/)
+HOME="$H11" bash "$SCRIPT" apply --yes --no-backup > "$T/hub-apply2.out" 2>&1; rc=$?
+check "hub: after the manual merge, apply links the path into ~/.claude" "[ $rc -eq 0 ] && [ \"\$(readlink $H11/.claude-shared/uploads)\" = $H11/.claude/uploads ] && [ -f $H11/.claude-work/uploads/u1 ]"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-verify3.out" 2>&1; rc=$?
+check "hub: verify clean, and says how many paths resolve into ~/.claude" "[ $rc -eq 0 ] && grep -q 'hub layout: 17 shared path(s) resolve into' $T/hub-verify3.out"
+check "hub: verify does not warn about settings pointing into ~/.claude" "! grep -q 'references paths under ~/.claude/' $T/hub-verify3.out && grep -q 'fine in the hub layout' $T/hub-verify3.out"
+HOME="$H11" bash "$SCRIPT" finalize --yes > "$T/hub-fin1.out" 2>&1; rc=$?
+check "hub: finalize still refuses once everything is clean and recorded" "[ $rc -ne 0 ] && grep -q 'uses the hub layout' $T/hub-fin1.out && [ -d $H11/.claude ] && [ '$hub_before' = \"\$(hubsnap $H11)\" ]"
+
+# Broken links, one in each direction.
+mv "$H11/.claude/agents" "$H11/.claude/agents.moved"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-broken1.out" 2>&1; rc=$?
+check "hub: verify reports a shared entry whose ~/.claude target is gone" "[ $rc -ne 0 ] && grep -qF 'broken: $H11/.claude-shared/agents -> $H11/.claude/agents, which does not exist' $T/hub-broken1.out"
+mv "$H11/.claude/agents.moved" "$H11/.claude/agents"
+rmdir "$H11/.claude/rules"; ln -s "$T/nowhere" "$H11/.claude/rules"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-broken2.out" 2>&1; rc=$?
+check "hub: verify reports a ~/.claude entry that is itself a broken link" "[ $rc -ne 0 ] && grep -qF 'broken: $H11/.claude/rules -> $T/nowhere, which does not exist' $T/hub-broken2.out"
+rm "$H11/.claude/rules"; mkdir "$H11/.claude/rules"
+HOME="$H11" bash "$SCRIPT" verify > "$T/hub-verify4.out" 2>&1; rc=$?
+check "hub: verify clean again once both links resolve" "[ $rc -eq 0 ]"
+
+# ~/.claude-shared as one link to ~/.claude, rather than a directory of links.
+H12="$T/home_hub_whole"
+mkhub "$H12"
+rm -rf "$H12/.claude-shared"; ln -s "$H12/.claude" "$H12/.claude-shared"
+printf 'MAIN=work\nSECOND=personal\nSHARE_MODE=full\n' > "$H12/.claude/.claude-profiles.conf"
+hubw_before=$(hubsnap "$H12")
+HOME="$H12" bash "$SCRIPT" verify > "$T/hubw-verify0.out" 2>&1; rc=$?
+check "hub (whole dir): verify runs instead of refusing source == shared" "! grep -q 'one of the directories this script manages' $T/hubw-verify0.out && grep -q 'the whole shared directory is' $T/hubw-verify0.out"
+HOME="$H12" bash "$SCRIPT" finalize --yes > "$T/hubw-fin.out" 2>&1; rc=$?
+check "hub (whole dir): finalize refuses" "[ $rc -ne 0 ] && grep -q 'uses the hub layout' $T/hubw-fin.out && [ -d $H12/.claude ]"
+HOME="$H12" bash "$SCRIPT" apply --yes --shell > "$T/hubw-apply.out" 2>&1; rc=$?
+check "hub (whole dir): apply exits 0 and leaves the existing hub data alone" "[ $rc -eq 0 ] && [ '$hubw_before' = \"\$(hubsnap $H12)\" ]"
+check "hub (whole dir): ~/.claude-shared is still the link, missing paths created in ~/.claude" "[ -L $H12/.claude-shared ] && [ -d $H12/.claude/tasks ] && [ ! -L $H12/.claude/tasks ] && [ -L $H12/.claude-work/tasks ]"
+HOME="$H12" bash "$SCRIPT" verify > "$T/hubw-verify1.out" 2>&1; rc=$?
+check "hub (whole dir): verify clean after apply" "[ $rc -eq 0 ] && grep -q 'hub layout: 17 shared path(s) resolve into' $T/hubw-verify1.out"
+
+# A fresh machine choosing the hub layout up front, with only ~/.claude.
+H13="$T/home_hub_fresh"
+mkdir -p "$H13/.claude/projects/-p" "$H13/.claude/skills/x"
+printf '{"type":"user"}\n' > "$H13/.claude/projects/-p/s.jsonl"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H13/.claude/settings.json"
+printf '{"claudeAiOauth":{"accessToken":"FAKE"}}\n' > "$H13/.claude/.credentials.json"
+printf 'export PATH=$PATH\n' > "$H13/.bashrc"
+HOME="$H13" bash "$SCRIPT" apply --yes --shell --layout hub > "$T/hubf-apply.out" 2>&1; rc=$?
+check "hub (fresh): apply --layout hub exits 0" "[ $rc -eq 0 ] && grep -q 'hub layout (--layout hub' $T/hubf-apply.out"
+check "hub (fresh): shared entries are links into ~/.claude, nothing copied" "[ \"\$(readlink $H13/.claude-shared/projects)\" = $H13/.claude/projects ] && [ \"\$(readlink $H13/.claude-shared/history.jsonl)\" = $H13/.claude/history.jsonl ] && [ -f $H13/.claude/history.jsonl ] && [ -f $H13/.claude-work/projects/-p/s.jsonl ]"
+check "hub (fresh): conf records LAYOUT=hub" "grep -q '^LAYOUT=hub' $H13/.claude-shared/.claude-profiles.conf"
+HOME="$H13" bash "$SCRIPT" verify > "$T/hubf-verify.out" 2>&1; rc=$?
+check "hub (fresh): verify without the flag is clean and knows the layout" "[ $rc -eq 0 ] && grep -q 'hub layout:' $T/hubf-verify.out"
+HOME="$H13" bash "$SCRIPT" plan --source "$T/altsrc" > "$T/hubf-src.out" 2>&1; rc=$?
+check "hub (fresh): a --source other than ~/.claude is refused" "[ $rc -ne 0 ] && grep -q 'source has to be' $T/hubf-src.out"
+# Recorded but no longer detectable (every link gone): finalize still refuses.
+rm -f "$H13"/.claude-shared/*
+for d in "$H13"/.claude-work "$H13"/.claude-personal; do find "$d" -maxdepth 1 -type l -exec rm {} +; done
+HOME="$H13" bash "$SCRIPT" finalize --yes > "$T/hubf-fin.out" 2>&1; rc=$?
+check "hub (fresh): finalize refuses on LAYOUT=hub alone, with no links left to detect" "[ $rc -ne 0 ] && grep -q 'uses the hub layout' $T/hubf-fin.out && [ -d $H13/.claude ]"
+
+# The standard layout: the new section says so, and still catches a broken
+# link inside ~/.claude-shared.
+check "standard: verify names the standard layout" "grep -q 'standard layout:' $T/verify5.out"
+H14="$T/home_std_broken"
+mkdir -p "$H14/.claude/plans"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H14/.claude/settings.json"
+printf 'export PATH=$PATH\n' > "$H14/.bashrc"
+HOME="$H14" bash "$SCRIPT" apply --yes --shell > "$T/std-apply.out" 2>&1
+check "standard: apply records LAYOUT=standard" "grep -q '^LAYOUT=standard' $H14/.claude-shared/.claude-profiles.conf"
+rm -rf "$H14/.claude-shared/plans"; ln -s "$T/nowhere" "$H14/.claude-shared/plans"
+HOME="$H14" bash "$SCRIPT" verify > "$T/std-broken.out" 2>&1; rc=$?
+check "standard: verify reports a broken link inside ~/.claude-shared" "[ $rc -ne 0 ] && grep -qF 'broken: $H14/.claude-shared/plans -> $T/nowhere, which does not exist' $T/std-broken.out"
+check "standard: an unrelated link does not switch the layout to hub" "! grep -q 'layout                  : hub' $T/std-broken.out"
+
 echo
 echo "passed=$pass failed=$fail   (outputs in $T)"
 [ "$fail" -eq 0 ]

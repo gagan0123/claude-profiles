@@ -24,7 +24,11 @@ and the failure modes, and you need both.
    is the fallback if this goes wrong. Read-only, always. The script's
    `finalize` command is the one exception, and you never run it unless the
    user asks for it by name in this conversation. Never `rm -rf ~/.claude`
-   yourself under any circumstances, and never as a "cleanup" step.
+   yourself under any circumstances, and never as a "cleanup" step. If the
+   user also uses the Claude Desktop app, or `verify` or the banner reports
+   the **hub layout** (`~/.claude-shared` linking back into `~/.claude`),
+   `~/.claude` holds the only copy of the shared data: `finalize` refuses
+   there, and you never suggest it. See the README's "Hub layout" section.
 3. **Never make `.credentials.json` or `.claude.json` a symlink.** Those two
    files being real and separate per profile is what isolates the accounts.
 4. **Do not modify `claude-profiles.sh` to work around a failure.** If it

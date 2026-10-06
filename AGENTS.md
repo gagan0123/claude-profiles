@@ -37,6 +37,15 @@ bug even if every test passes.
    records `FINALIZED=<stamp>` in the conf file, which is what lets `verify`
    keep passing and what makes `plan`/`apply` refuse with a specific
    message. Adding a ninth gate is fine; removing one is a bug.
+   **The hub layout** (`--layout hub`, `LAYOUT=hub`, or detected because
+   `~/.claude-shared` resolves back into `~/.claude`) changes two things.
+   `finalize` refuses before gate 1, on detection, record or flag alike,
+   because there `~/.claude` is the only copy of the shared data and the
+   Claude Desktop app reads nothing else. And `apply` may create a shared
+   path that `~/.claude` lacks, empty (`mkdir`/`touch` in `hub_entry`), and
+   nothing else: it never copies out of, moves, overwrites or deletes
+   anything that exists there. `tests/e2e.sh` fingerprints every
+   pre-existing hub entry around each hub command.
 2. **`.credentials.json`, `.claude.json` and `sessions/` are per-profile real
    files, never symlinks, never shared.** The `PRIVATE` list in the script
    and the "Credential isolation" section of `verify` enforce this.
@@ -129,7 +138,14 @@ when the profile already has a `settings.json`), and the `status` and
 same exit status as the plain form), and the `claudeMdExcludes` entry for
 `~/.claude/CLAUDE.md` (added once, not relocated, not a `finalize` gate 4
 reference, never merged into an existing array, flagged by `verify` when
-missing), and the `statusline` command (refused before `apply` and without
+missing), the hub layout (detection of a hand-made hub and of a whole-directory link,
+`finalize` refused before any gate and on a recorded `LAYOUT=hub` alone,
+`plan` changing nothing, `apply` linking instead of copying and leaving
+every existing hub entry byte-identical, an empty real copy relinked, a
+real copy holding data left alone, the README's manual merge, `--layout
+standard`, `--adopt` and a foreign `--source` refused, and `verify`
+reporting broken links in both directions and a standard layout's broken
+link), and the `statusline` command (refused before `apply` and without
 a terminal, never installed by `apply`, a user's own `statusLine` left
 alone without `--replace` and backed up with it, re-run idempotent and
 updating a stale copy, `--remove`) plus `statusline.sh` itself fed JSON:

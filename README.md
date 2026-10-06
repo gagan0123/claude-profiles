@@ -97,6 +97,8 @@ Useful options:
                  every other one starts empty and logs in via the browser
 --share full     share transcripts too (default)
 --share safe     do NOT share transcripts, see below
+--layout hub     keep the shared data in ~/.claude for Claude Desktop, see
+                 "Hub layout" below (default: standard, or what is detected)
 --source DIR     seed from a profile other than ~/.claude
 --shell          append the source line to your .zshrc / .bashrc for you
 --no-backup      skip the tar archive (only sensible on a re-run of apply; for
@@ -112,8 +114,8 @@ Useful options:
 `--profiles NAME,NAME`; using either prints a deprecation notice, and
 combining them with `--profiles` is an error.
 
-`--profiles` (recorded as `PROFILES=name,name,...`), `--share` and `--source`
-are remembered in `~/.claude-shared/.claude-profiles.conf` after `apply`, so
+`--profiles` (recorded as `PROFILES=name,name,...`), `--share`, `--layout`
+(recorded as `LAYOUT=standard` or `LAYOUT=hub`) and `--source` are remembered in `~/.claude-shared/.claude-profiles.conf` after `apply`, so
 `verify` and `rollback` use the same values without you repeating them.
 Explicit flags always win.
 
@@ -298,6 +300,10 @@ at a single shared location.
                            verify and rollback do not need the flags again
 ```
 
+That is the **standard layout**. If you also use the Claude Desktop app,
+which only ever reads `~/.claude`, see [Hub layout](#hub-layout-claude-desktop)
+for the variant that keeps the shared data in `~/.claude` instead.
+
 A third profile, and any further one, looks exactly like profile 2 above:
 its own fresh-login `.credentials.json`, its own `.claude.json`, and the same
 symlinks into `~/.claude-shared`.
@@ -322,7 +328,9 @@ account. The script is built around avoiding that:
    with a symlink inside it. If the whole setup turns out to be a mistake,
    delete the three new directories and your original profile is exactly as
    it was. The one exception is `finalize`, which exists to delete it, on
-   your explicit command, after every gate below passes.
+   your explicit command, after every gate below passes. In the
+   [hub layout](#hub-layout-claude-desktop) `apply` may also create a shared
+   path that `~/.claude` lacks, empty, and `finalize` refuses outright.
 2. **A tar backup of `~/.claude` and `~/.claude.json` is taken first**, into
    `~/.claude-backups/`, before anything is created. The archive is read back
    before the script continues; if tar fails outright, nothing else happens.
@@ -487,6 +495,106 @@ storage").
 
 ---
 
+## Hub layout (Claude Desktop)
+
+The standard layout moves the shared data's home to `~/.claude-shared` and,
+once you run `finalize`, deletes `~/.claude`. That is a problem if you also
+use the **Claude Desktop app**, which reads `~/.claude`: it is not started
+through the `claude-<name>` launchers, so `CLAUDE_CONFIG_DIR` never reaches
+it. The hub layout keeps `~/.claude` as the hub:
+
+```
+~/.claude              the HUB. The real shared data stays here, and
+  projects/              Claude Desktop keeps reading and writing it.
+  history.jsonl
+  skills/ ...
+
+~/.claude-shared       one link per shared path, pointing back into the hub
+  projects      -> ~/.claude/projects
+  history.jsonl -> ~/.claude/history.jsonl
+  skills        -> ~/.claude/skills
+  ...
+  .claude-profiles.conf  records LAYOUT=hub
+
+~/.claude-<name>       each profile, exactly as in the standard layout:
+  projects      -> ~/.claude-shared/projects   (resolves into the hub)
+  .credentials.json, .claude.json   real, per-profile files
+```
+
+A variant where `~/.claude-shared` is itself one link to `~/.claude` is
+recognised as well.
+
+**Choosing it.** On a new setup, pass `--layout hub` to `plan` and `apply`:
+
+```bash
+./claude-profiles.sh plan  --layout hub
+./claude-profiles.sh apply --layout hub --shell
+```
+
+It is recorded as `LAYOUT=hub` in the conf file, so later commands need no
+flag. A setup that is **already** in this shape (an early launcher edited by
+hand, say) is detected without the flag: if `~/.claude-shared` is a link to
+`~/.claude`, or any shared path in it is a link into `~/.claude`, the script
+treats the setup as hub. Passing `--layout standard` on such a setup is
+refused rather than guessed at; converting between the layouts is not
+something the script does.
+
+**What changes in hub mode:**
+
+- `apply` and `plan` **link instead of copying**. Nothing is copied out of
+  `~/.claude`, and nothing in it is moved, overwritten or deleted. A shared
+  path the hub does not have yet is created there empty (an empty `mkdir` or
+  `touch`), so that every profile and Desktop see one copy. That is the only
+  write `apply` makes inside `~/.claude`, and only in this layout.
+- An existing link in `~/.claude-shared` is kept as it is. A **real, empty**
+  directory there (what an earlier standard `apply` created for a path the
+  source lacked) is replaced with a link into the hub; `rmdir` only removes
+  an empty directory, so nothing can be lost. A real copy that **holds
+  data** is left alone and reported: see the repair below.
+- `statusLine`, hook and command paths under `~/.claude/` are left as they
+  are rather than relocated, because `~/.claude` stays.
+- `--adopt` is refused, since it would merge data into `~/.claude`.
+- **`finalize` always refuses**, before its first gate, whether the layout
+  was detected, recorded or asked for. Here `~/.claude` is not a spare copy;
+  it is the only copy of every profile's transcripts, history and skills.
+  Never delete it by hand either.
+- `verify` has a "Shared layout" section that lists each shared path that
+  resolves into `~/.claude`, and counts as a problem: a link in
+  `~/.claude-shared` whose target is gone, a path in `~/.claude` that is
+  itself a broken link, a real copy in `~/.claude-shared` that Desktop
+  cannot see, a missing path, and a hub layout the conf file does not record
+  yet. In the standard layout the same section still reports any broken link
+  inside `~/.claude-shared`.
+
+**Checking and repairing an existing hub setup.** Update the script, then:
+
+```bash
+./claude-profiles.sh verify              # read-only; lists what resolves into ~/.claude
+./claude-profiles.sh plan                # read-only; shows what apply would link or create
+./claude-profiles.sh apply --shell       # records LAYOUT=hub, links missing paths, relinks empty copies
+./claude-profiles.sh verify
+```
+
+If `verify` still reports `real copy, not a link into ~/.claude: ... (holds
+data: merge by hand)`, a profile has been writing into a copy that Desktop
+never sees. Quit every Claude Code session and Claude Desktop, then, for
+each such path `X` (a directory):
+
+```bash
+mv ~/.claude-shared/X ~/.claude-shared/.X.pre-hub        # set the copy aside, nothing deleted
+mkdir -p ~/.claude/X
+cp -Rpn ~/.claude-shared/.X.pre-hub/. ~/.claude/X/        # copy in what the hub lacks, never overwrite
+./claude-profiles.sh apply --no-backup                    # links ~/.claude-shared/X -> ~/.claude/X
+./claude-profiles.sh verify
+```
+
+`cp -n` never overwrites a file already in the hub; on macOS it may exit 1
+when it skipped one, which is expected here. Delete `.X.pre-hub` once you
+are satisfied. Between the `mv` and the `apply` the profiles' link for `X`
+dangles, which is why sessions have to be closed first.
+
+---
+
 ## What is deliberately NOT shared
 
 | Path | Why not |
@@ -626,7 +734,9 @@ transcripts are on disk twice. When you no longer want the duplicate:
 ```
 
 This is the one command in the script whose purpose is to delete
-`~/.claude`, and the only supported way to do it. A hand-run
+`~/.claude`, and the only supported way to do it. **It never runs on the
+[hub layout](#hub-layout-claude-desktop)**, where `~/.claude` holds the only
+copy of the shared data; there it refuses before the first gate. A hand-run
 `rm -rf ~/.claude` is a genuinely bad idea: it can delete the transcript of
 a session that is still running, remove a `statusLine` or hook script that
 every new profile still points at, or run from a terminal that *is itself* a

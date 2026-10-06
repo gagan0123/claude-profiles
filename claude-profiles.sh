@@ -13,6 +13,9 @@
 #   The single exception is the `finalize` command, whose whole purpose is to
 #   delete ~/.claude once you no longer want the duplicate; it runs eight
 #   gates and a confirmation first, and never runs as part of plan or apply.
+#   With --layout hub (for the Claude Desktop app, which reads ~/.claude),
+#   ~/.claude stays the home of the shared data: apply only links to it and
+#   may create a shared path it lacks, empty, and finalize always refuses.
 #   Everything new lives in one directory per profile, plus one shared one:
 #
 #     ~/.claude-<first>    new profile, inherits your current config + login
@@ -58,6 +61,22 @@ SL_REMOVE=0
 JSON=0
 JSON_FILE=""
 VERIFY_PROBLEMS=0
+
+# Layout of the shared data. "standard": ~/.claude-shared holds the one real
+# copy, and ~/.claude is the source that finalize may eventually delete.
+# "hub": ~/.claude stays the real home of the shared data and every entry in
+# ~/.claude-shared is a link back into it (or ~/.claude-shared is itself a
+# link to ~/.claude), because the Claude Desktop app only ever reads
+# ~/.claude. Chosen with --layout, recorded as LAYOUT= in the conf file, and
+# also detected from the filesystem: see detect_hub(). HUB is always $HOME's
+# ~/.claude, whatever --source says, because that is what Desktop reads.
+LAYOUT="standard"
+LAYOUT_SET=0
+CONF_LAYOUT=""
+HUB="${HOME}/.claude"
+HUB_MODE=0      # 1 when the effective layout is hub: asked for, recorded or detected
+HUB_DETECTED=0  # 1 when the filesystem already has shared entries resolving into HUB
+HUB_WHOLE=0     # 1 when ~/.claude-shared is itself a link to HUB
 
 # One timestamp for the whole run, so an adopt archive and the .adopted-<stamp>
 # directory it came from carry the same name.
@@ -273,6 +292,61 @@ same_path() {
   [ "$pa" = "$pb" ]
 }
 
+phys_dir() {
+  # The physical path of a directory (pwd -P), or the argument unchanged when
+  # it is not a directory. No readlink -f: macOS before 12.3 lacks it.
+  if [ -d "$1" ]; then (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"
+  else printf '%s' "$1"; fi
+}
+
+link_target_abs() {
+  # The absolute target of symlink $1, one level only, with its parent
+  # directory canonicalised when that directory exists. Works for a dangling
+  # link too, which is the case that matters most: a link into a ~/.claude
+  # that is gone still has to be recognised as pointing there.
+  local l="$1" t d
+  t=$(readlink "$l") || return 1
+  case "$t" in /*) ;; *) t="$(dirname "$l")/${t}" ;; esac
+  t="${t%/}"
+  d=$(dirname "$t")
+  if [ -d "$d" ]; then t="$(phys_dir "$d")/$(basename "$t")"; fi
+  printf '%s' "$t"
+}
+
+points_at_hub() {
+  # True if $1 is a symlink whose target is HUB itself or anything inside it,
+  # whether or not that target exists. String compare against both the
+  # spelled and the physical HUB path, so a $HOME reached through a symlink
+  # (macOS /var -> /private/var) still matches.
+  [ -L "$1" ] || return 1
+  local t hp
+  t=$(link_target_abs "$1") || return 1
+  hp=$(phys_dir "$HUB")
+  case "$t" in
+    "$HUB"|"$HUB"/*|"$hp"|"$hp"/*) return 0 ;;
+  esac
+  return 1
+}
+
+detect_hub() {
+  # Sets HUB_DETECTED (and HUB_WHOLE) when the filesystem already has the hub
+  # layout: ~/.claude-shared is itself a link to ~/.claude, or any entry in
+  # it named like a shared path is a link into ~/.claude. Only shared-path
+  # names count, from the full list whatever --share says, so a stray link
+  # of some other name cannot switch the layout. Read-only.
+  local p
+  HUB_DETECTED=0; HUB_WHOLE=0
+  if [ -L "$SHARED" ]; then
+    if points_at_hub "$SHARED"; then HUB_DETECTED=1; HUB_WHOLE=1; fi
+    return 0
+  fi
+  [ -d "$SHARED" ] || return 0
+  for p in $DATA_FULL $CONFIG_SHARED; do
+    if points_at_hub "${SHARED}/${p}"; then HUB_DETECTED=1; return 0; fi
+  done
+  return 0
+}
+
 valid_name() {
   case "$1" in
     "") return 1 ;;
@@ -379,6 +453,19 @@ Options:
                       safe = share plans/skills only, transcripts stay
                              per-profile. history.jsonl (every prompt you
                              typed) is still shared either way. See README.md.
+  --layout MODE     standard | hub   (default: standard, or what is recorded
+                    or detected)
+                      standard = ~/.claude-shared holds the one real copy;
+                                 finalize can later delete ~/.claude
+                      hub      = ~/.claude stays the real home of the shared
+                                 data and ~/.claude-shared links back into
+                                 it, because the Claude Desktop app only
+                                 reads ~/.claude. apply links instead of
+                                 copying, never moves anything out of
+                                 ~/.claude, and finalize always refuses.
+                    A setup whose ~/.claude-shared already resolves into
+                    ~/.claude is detected as hub without the flag. Recorded
+                    as LAYOUT= in the conf file. See README.md, "Hub layout".
   --source DIR      profile to seed from (default: ${SOURCE})
   --settings NAME=PATH
                     seed that one profile's settings.json from PATH instead
@@ -463,6 +550,7 @@ while [ $# -gt 0 ]; do
     --main)   MAIN_ARG="${2:?--main needs a name}";     MAIN_SET=1;   shift 2 ;;
     --second) SECOND_ARG="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
     --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
+    --layout) LAYOUT="${2:?--layout needs standard or hub}"; LAYOUT_SET=1; shift 2 ;;
     --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
     --settings)
       # NAME=PATH. The name and the file are checked later, against the
@@ -537,6 +625,8 @@ if [ -f "$CONF_FILE" ]; then
       CLAUDE_VERSION) CONF_CLAUDE_VERSION="$v" ;;
       FINALIZED)  CONF_FINALIZED="$v" ;;
       ADOPTED)    CONF_ADOPTED="$v" ;;
+      LAYOUT)     CONF_LAYOUT="$v"
+                  if [ "$LAYOUT_SET" -eq 0 ]; then LAYOUT="$v"; fi ;;
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
@@ -550,6 +640,10 @@ case "$SHARE_MODE" in
   full) SHARE_DATA="$DATA_FULL" ;;
   safe) SHARE_DATA="$DATA_SAFE" ;;
   *) die "--share must be 'full' or 'safe', got '${SHARE_MODE}'" ;;
+esac
+case "$LAYOUT" in
+  standard|hub) ;;
+  *) die "--layout must be 'standard' or 'hub', got '${LAYOUT}'" ;;
 esac
 
 # -- which profiles this run is about ----------------------------------------
@@ -636,12 +730,43 @@ fi
 SOURCE="${SOURCE%/}"
 SHARE_ALL="${SHARE_DATA} ${CONFIG_SHARED}"
 
+# -- layout: standard or hub --------------------------------------------------
+# What is on disk wins over a recorded LAYOUT=standard, because acting on a hub
+# layout as if it were standard is the dangerous direction (finalize would
+# delete the only real copy). Asking for standard explicitly on a hub layout
+# is refused rather than guessed at.
+detect_hub
+if [ "$HUB_DETECTED" -eq 1 ] && [ "$LAYOUT_SET" -eq 1 ] && [ "$LAYOUT" = "standard" ]; then
+  die "--layout standard, but ${SHARED} already resolves into ${HUB}: this is
+       a hub layout, where ${HUB} holds the real shared data because Claude
+       Desktop only reads ${HUB}. Converting it to the standard layout is not
+       something this script does. Drop --layout standard (the hub layout is
+       detected), or see README.md, 'Hub layout'."
+fi
+if [ "$LAYOUT" = "hub" ] || [ "$HUB_DETECTED" -eq 1 ]; then
+  HUB_MODE=1
+  LAYOUT="hub"
+  if ! same_path "$SOURCE" "$HUB"; then
+    die "the hub layout keeps ${HUB} as the home of the shared data, so the
+       source has to be ${HUB} too, not '${SOURCE}'. Drop --source, or use
+       --layout standard on a setup that has no links into ${HUB}."
+  fi
+  if [ "$ADOPT" -eq 1 ]; then
+    die "--adopt is not supported with the hub layout: it merges data into
+       ${SHARED}, which here resolves into ${HUB}, and nothing in this script
+       writes existing data into ${HUB}. Move the profile directory aside, or
+       merge it by hand (README.md, 'Hub layout')."
+  fi
+fi
+
 for d in $PROFILES; do
   if same_path "$SOURCE" "$(profile_dir "$d")"; then
     die "source '${SOURCE}' is one of the directories this script manages. Refusing."
   fi
 done
-if same_path "$SOURCE" "$SHARED"; then
+# A ~/.claude-shared that is itself a link to ~/.claude resolves to the source
+# on purpose in the hub layout; that is the one case where the two may match.
+if [ "$HUB_WHOLE" -eq 0 ] && same_path "$SOURCE" "$SHARED"; then
   die "source '${SOURCE}' is one of the directories this script manages. Refusing."
 fi
 
@@ -680,6 +805,18 @@ preflight() {
        If you have never run Claude Code, run it once and log in first."
   fi
   ok "source profile found: ${SOURCE}"
+
+  if [ "$HUB_MODE" -eq 1 ]; then
+    if [ "$HUB_DETECTED" -eq 1 ]; then
+      info "hub layout detected: ${SHARED} resolves back into ${HUB}"
+    else
+      info "hub layout (--layout hub, or LAYOUT=hub in ${CONF_FILE})"
+    fi
+    info "${HUB} stays the home of the shared data, because Claude Desktop only"
+    info "reads ${HUB}. Shared paths are linked, not copied; nothing in ${HUB} is"
+    info "moved, overwritten or deleted. A shared path the hub does not have yet"
+    info "is created there, empty, so that every profile and Desktop see one copy."
+  fi
 
   if [ ! -e "${SOURCE}/settings.json" ] && [ ! -e "${SOURCE}/projects" ] \
      && [ ! -e "${SOURCE}/.credentials.json" ]; then
@@ -775,6 +912,8 @@ preflight() {
   # copy of the whole source. Budget for the worst case of both.
   local p need=0 src_kb have total
   for p in $SHARE_ALL; do
+    # The hub layout links to the data where it is; nothing is copied.
+    [ "$HUB_MODE" -eq 1 ] && break
     [ -e "${SOURCE}/${p}" ] || continue
     [ -e "${SHARED}/${p}" ] && continue
     need=$((need + $(dir_kb "${SOURCE}/${p}")))
@@ -883,6 +1022,7 @@ do_backup() {
 # ------------------------------------------------------------------ shared --
 
 seed_shared() {
+  if [ "$HUB_MODE" -eq 1 ]; then seed_shared_hub; return 0; fi
   hdr "Shared directory: ${SHARED}"
   run mkdir -p "$SHARED"
 
@@ -917,6 +1057,85 @@ seed_shared() {
   done
 }
 
+hub_entry() {
+  # Hub layout: make sure ${HUB}/$1 exists before something links to it.
+  # Present: nothing to do. A dangling link there: reported, left alone, and
+  # the path is not linked (return 1). Missing: created empty. That empty
+  # mkdir/touch is the only thing apply ever writes inside ${HUB}, and only in
+  # the hub layout, where ${HUB} is the live shared store that Claude Code and
+  # Claude Desktop already write into; it never touches anything that exists.
+  local p="$1" h="${HUB}/$1"
+  [ -e "$h" ] && return 0
+  if [ -L "$h" ]; then
+    warn "${h} is a broken link (-> $(readlink "$h")). Not linking ${p};"
+    warn "fix or remove that link, then re-run apply. 'verify' reports it too."
+    return 1
+  fi
+  case "$p" in
+    *.jsonl) info "create ${h} (empty: the hub had none)"
+             run touch "$h" ;;
+    *)       info "create ${h}/ (empty: the hub had none)"
+             run mkdir "$h" ;;
+  esac
+  return 0
+}
+
+seed_shared_hub() {
+  # The hub-layout counterpart of seed_shared(): ${HUB} keeps the real data,
+  # and ${SHARED} gets one link per shared path pointing at ${HUB}/<path>, so
+  # the profiles' existing links (profile/<path> -> ${SHARED}/<path>) resolve
+  # through to it. Nothing is copied out of ${HUB}, and no link or real copy
+  # already in ${SHARED} is replaced, with one exception: an EMPTY real
+  # directory, which is what an earlier standard apply created for a path the
+  # source lacked. rmdir only ever removes an empty directory, so if anything
+  # wrote into it in the meantime the rmdir fails and nothing is lost.
+  hdr "Shared directory: ${SHARED} (hub layout: the data stays in ${HUB})"
+  local p s h
+  if [ "$HUB_WHOLE" -eq 1 ]; then
+    info "${SHARED} is itself a link to ${HUB}, so every shared path is the"
+    info "hub's own. Only paths the hub is missing are created."
+  else
+    run mkdir -p "$SHARED"
+  fi
+  for p in $SHARE_ALL; do
+    s="${SHARED}/${p}"
+    h="${HUB}/${p}"
+    if [ "$HUB_WHOLE" -eq 1 ]; then
+      if [ -e "$h" ]; then info "keep   ${p} (in ${HUB})"
+      else hub_entry "$p" || true; fi
+      continue
+    fi
+    if [ -L "$s" ]; then
+      if [ -e "$s" ]; then
+        info "keep   ${p} -> $(readlink "$s")"
+      else
+        warn "${s} is a broken link (-> $(readlink "$s")). Left alone;"
+        warn "'verify' reports it. Fix the target, or remove the link and re-run apply."
+      fi
+      continue
+    fi
+    if [ -e "$s" ]; then
+      if [ -d "$s" ] && [ -z "$(ls -A "$s" 2>/dev/null)" ]; then
+        hub_entry "$p" || continue
+        info "relink ${p}: empty real directory in ${SHARED} -> ${h}"
+        if run rmdir "$s"; then
+          run ln -s "$h" "$s"
+        else
+          warn "${s} is no longer empty; left alone. Re-run apply to see why."
+        fi
+      else
+        warn "${s} is a real copy, not a link into ${HUB}."
+        warn "Claude Desktop does not see it, and it drifts apart from ${h}."
+        warn "Left alone: merging it is a manual step (README.md, 'Hub layout')."
+      fi
+      continue
+    fi
+    hub_entry "$p" || continue
+    info "link   ${p} -> ${h}"
+    run ln -s "$h" "$s"
+  done
+}
+
 adopted_value() {
   # The ADOPTED= line for the conf file: whatever a previous apply recorded,
   # plus whatever this run adopted, comma separated and deduped. A later
@@ -933,7 +1152,7 @@ adopted_value() {
 
 write_conf() {
   if [ "$DRY" -eq 1 ]; then
-    info "would record PROFILES/SHARE_MODE/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
+    info "would record PROFILES/SHARE_MODE/LAYOUT/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
     return 0
   fi
   # PROFILES= replaces the MAIN=/SECOND= pair older versions wrote; the
@@ -942,6 +1161,7 @@ write_conf() {
     printf 'VERSION=%s\n'    "$VERSION"
     printf 'PROFILES=%s\n'   "$(profiles_csv)"
     printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
+    printf 'LAYOUT=%s\n'     "$LAYOUT"
     printf 'SOURCE=%s\n'     "$SOURCE"
     printf 'CLAUDE_VERSION=%s\n' "$(claude_version)"
     printf 'ADOPTED=%s\n'    "$(adopted_value)"
@@ -994,6 +1214,15 @@ relocate_settings_scripts() {
 
   candidates=$(find_old_claude_paths "$scan_from")
   [ -n "$candidates" ] || return 0
+
+  # Relocation exists so that finalize can delete the source. The hub layout
+  # keeps ~/.claude for good, so a path into it stays valid; copying the
+  # script would only leave two copies to drift apart.
+  if [ "$HUB_MODE" -eq 1 ]; then
+    info "keep   settings paths under ${HUB} (hub layout: ${HUB} stays):"
+    info "       $(printf '%s' "$candidates" | tr '\n' ' ')"
+    return 0
+  fi
 
   # Prefixes held in variables: a quoted literal inside ${c#...} is parsed
   # differently by bash 3.2 and 4.3+, a variable is not.
@@ -1757,6 +1986,90 @@ do_verify() {
     fi
   done
 
+  hdr "Shared layout"
+  # The links above are profile -> ${SHARED}. This section looks one level
+  # further, at what ${SHARED} itself holds, because in the hub layout its
+  # entries are links back into ${HUB}, and a profile link that resolves
+  # through a broken one of those is broken too. Every broken link is a
+  # problem, in either direction: ${SHARED}/<path> whose target is gone, and
+  # (hub layout) ${HUB}/<path> whose target is gone.
+  local s h t lbad=0 nhub=0 ncopy=0 hand=0
+  if [ "$HUB_MODE" -eq 1 ] && [ "$CONF_LOADED" -eq 1 ] && [ "$CONF_LAYOUT" != "hub" ]; then
+    warn "${SHARED} resolves back into ${HUB} (the hub layout), but"
+    warn "${CONF_FILE} does not record LAYOUT=hub."
+    warn "Re-run apply: it detects the layout, links instead of copying, and"
+    warn "records it. finalize refuses on this layout either way."
+    lbad=$((lbad+1))
+  fi
+  if [ -L "$SHARED" ]; then
+    t=$(readlink "$SHARED")
+    if [ ! -e "$SHARED" ]; then
+      warn "broken: ${SHARED} -> ${t}, which does not exist"
+      lbad=$((lbad+1))
+    elif [ "$HUB_WHOLE" -eq 1 ]; then
+      info "${SHARED} -> ${t}: the whole shared directory is ${HUB} (hub layout)"
+    else
+      info "${SHARED} -> ${t} (a link, not into ${HUB})"
+    fi
+  fi
+  for p in $SHARE_ALL; do
+    s="${SHARED}/${p}"
+    h="${HUB}/${p}"
+    if [ "$HUB_WHOLE" -eq 0 ] && [ -L "$s" ]; then
+      t=$(readlink "$s")
+      if [ ! -e "$s" ]; then
+        warn "broken: ${s} -> ${t}, which does not exist"
+        lbad=$((lbad+1))
+      elif points_at_hub "$s"; then
+        info "${p} -> ${t} (into ${HUB})"
+        nhub=$((nhub+1))
+      else
+        info "${p} -> ${t} (a link, not into ${HUB})"
+      fi
+    elif [ "$HUB_MODE" -eq 1 ] && [ "$HUB_WHOLE" -eq 0 ] && [ -e "$s" ]; then
+      if [ -d "$s" ] && [ -z "$(ls -A "$s" 2>/dev/null)" ]; then
+        warn "real copy, not a link into ${HUB}: ${s} (empty: apply relinks it)"
+      else
+        warn "real copy, not a link into ${HUB}: ${s} (holds data: merge by hand)"
+        hand=1
+      fi
+      ncopy=$((ncopy+1))
+      lbad=$((lbad+1))
+    elif [ "$HUB_MODE" -eq 1 ] && [ ! -e "$s" ] && [ ! -L "$s" ]; then
+      warn "missing: ${s}. Re-run apply: it creates ${h} if needed and links it."
+      lbad=$((lbad+1))
+    elif [ "$HUB_WHOLE" -eq 1 ] && [ -e "$s" ]; then
+      nhub=$((nhub+1))
+    fi
+    # The other direction. In the whole-directory case ${s} is ${h}, so the
+    # check above has not looked at ${h} as a link yet either.
+    if [ "$HUB_MODE" -eq 1 ] && [ -L "$h" ] && [ ! -e "$h" ]; then
+      warn "broken: ${h} -> $(readlink "$h"), which does not exist"
+      lbad=$((lbad+1))
+    fi
+  done
+  if [ "$ncopy" -gt 0 ]; then
+    warn "Claude Desktop does not see a real copy in ${SHARED}: the profiles"
+    warn "write there while Desktop writes to ${HUB}, and the two drift apart."
+    if [ "$hand" -eq 1 ]; then
+      warn "One that holds data has to be merged into ${HUB} by hand first;"
+      warn "README.md, 'Hub layout', has the commands. Then re-run apply."
+    else
+      warn "Re-run apply to replace them with links into ${HUB}."
+    fi
+  fi
+  if [ "$lbad" -eq 0 ]; then
+    if [ "$HUB_MODE" -eq 1 ]; then
+      ok "hub layout: ${nhub} shared path(s) resolve into ${HUB}, which Claude"
+      ok "Desktop reads, so it and every profile see the same data. finalize"
+      ok "will refuse to delete ${HUB}."
+    else
+      ok "standard layout: ${SHARED} holds its own copy of the shared data"
+    fi
+  else
+    problems=$((problems+lbad))
+  fi
+
   hdr "Adopted data"
   # A .adopted-<stamp> directory is what --adopt left behind: the profile's
   # own copies of the shared paths, after their contents were merged into
@@ -1930,6 +2243,13 @@ do_verify() {
   local refs=0 extra
   for name in $PROFILES; do
     dir=$(profile_dir "$name")
+    if [ "$HUB_MODE" -eq 1 ] && refs_old_profile "${dir}/settings.json"; then
+      # Not even a warning: the hub layout keeps ${HUB} for good.
+      info "$(basename "$dir")/settings.json references paths under ${HUB}:"
+      info "  $(find_old_claude_paths "${dir}/settings.json" | tr '\n' ' ')"
+      info "  fine in the hub layout, where ${HUB} stays."
+      continue
+    fi
     if refs_old_profile "${dir}/settings.json"; then
       warn "$(basename "$dir")/settings.json references paths under ~/.claude/"
       warn "(statusLine command, hooks, or similar). apply relocates scripts"
@@ -1943,7 +2263,9 @@ do_verify() {
     fi
   done
   if [ "$refs" -eq 0 ]; then
-    if [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
+    if [ "$HUB_MODE" -eq 1 ]; then
+      ok "nothing that would break: the hub layout keeps ${HUB}"
+    elif [ -n "$CONF_FINALIZED" ] && [ ! -d "$SOURCE" ]; then
       ok "none"
     else
       ok "none (so 'finalize' can remove ${SOURCE} when you are ready)"
@@ -2181,8 +2503,13 @@ do_rollback() {
   say "It does NOT touch ${SOURCE} or ~/.claude.json, which were never modified."
   say "Your backups in ${BACKUP_ROOT} are left in place."
   say ""
-  warn "Any conversations you had ONLY under the new profiles live in"
-  warn "${SHARED} and will be lost. Copy them out first if you want them."
+  if [ "$HUB_MODE" -eq 1 ]; then
+    info "Hub layout: the shared data lives in ${HUB} and stays there; what"
+    info "goes from ${SHARED} is only the links into it."
+  else
+    warn "Any conversations you had ONLY under the new profiles live in"
+    warn "${SHARED} and will be lost. Copy them out first if you want them."
+  fi
 
   local d
   for name in $PROFILES; do
@@ -2619,6 +2946,22 @@ do_finalize() {
   local conf_src d vst stamp archive src_is_home entries name first
 
   hdr "Finalize"
+
+  # -- before any gate: never on the hub layout -----------------------------
+  # In the hub layout ${HUB} is not a fallback copy, it is where the shared
+  # data actually lives, and Claude Desktop reads nothing else. Refused on
+  # what is on disk (detection), on what was recorded, and on what was asked
+  # for, so that neither a stale conf file nor a missing one lets it through.
+  if [ "$HUB_MODE" -eq 1 ] || [ "$CONF_LAYOUT" = "hub" ]; then
+    die "refusing: this setup uses the hub layout, so finalize never runs here.
+       ${SHARED} resolves back into ${HUB} (or LAYOUT=hub is recorded in
+       ${CONF_FILE}): ${HUB} is not a spare copy, it is the one real copy of
+       every profile's transcripts, history, skills and plugins, and the
+       Claude Desktop app only reads ${HUB}. Deleting it would take all of
+       that with it and break every profile's links. Nothing was deleted.
+       To check the setup, run:  ./claude-profiles.sh verify"
+  fi
+
   say "This is the only command in this script that deletes ${SOURCE}."
   say "It runs eight gates first and asks before the deletion itself."
 
@@ -3052,6 +3395,10 @@ banner() {
   say "  profiles                : ${line}"
   say "  profile dirs            : ${HOME}/.claude-<name>, one per name above"
   say "  shared data             : ${SHARED}"
+  if [ "$HUB_MODE" -eq 1 ]; then
+    say "  layout                  : hub (${SHARED} links into ${HUB}, which"
+    say "                            Claude Desktop reads; finalize refuses)"
+  fi
 }
 
 build_profiles() {
@@ -3085,7 +3432,12 @@ case "$CMD" in
     banner
     preflight
     say ""
-    say "About to create the directories above. ${SOURCE} is only read."
+    if [ "$HUB_MODE" -eq 1 ]; then
+      say "About to create the directories above. Hub layout: nothing in ${HUB}"
+      say "is moved, overwritten or deleted; shared paths it lacks are created empty."
+    else
+      say "About to create the directories above. ${SOURCE} is only read."
+    fi
     confirm "Proceed?" || { say "aborted"; exit 1; }
     do_backup
     seed_shared
@@ -3112,6 +3464,12 @@ case "$CMD" in
     say "  5. Confirm sharing works: start a session in one profile, then"
     say "     run  claude-${SECOND_NAME} --resume  in the same project directory."
     say ""
+    if [ "$HUB_MODE" -eq 1 ]; then
+      say "  Hub layout: ${HUB} holds the shared data for every profile and for"
+      say "  Claude Desktop, so it stays. Never delete it, by hand or otherwise;"
+      say "  'finalize' refuses on this layout. Re-run 'verify' after any change."
+      exit 0
+    fi
     say "  ${SOURCE} is untouched and still works, and the shared data is a"
     say "  copy, so it is on disk twice until you remove it. When you are"
     say "  happy with the new setup, run:"
