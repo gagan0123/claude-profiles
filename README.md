@@ -417,6 +417,28 @@ per profile directory:
    account it already holds. In particular, a `~/.claude-<main>` that already
    has credentials keeps them; they are never overwritten from `~/.claude`.
 
+If you want the adopted profile to start with a fresh login instead of the
+account it already holds, move its credentials aside after `apply`, rather
+than deleting them or running `/logout`:
+
+```bash
+mv ~/.claude-personal/.credentials.json ~/.claude-personal/.adopted-<stamp>/
+```
+
+The next launch of `claude-personal` then asks for a browser login. The file
+is also in the adopt archive, so this is reversible.
+
+A hand-made setup usually left a shell alias behind too, such as
+`alias claude-personal="CLAUDE_CONFIG_DIR=~/.claude-personal claude"`. The
+launcher snippet runs `unalias` on its own names before defining them,
+because bash and zsh expand an alias while parsing a function of the same
+name and would otherwise fail with "syntax error near unexpected token
+`('". An alias defined *after* the snippet loads still overrides the
+launcher, so `verify` lists any `alias claude...` line it finds in your rc
+file, `~/.bash_aliases`, `~/.bashrc.d/` or `~/.zshrc.d/`. Comment it out.
+Keep a backup copy of that file outside `~/.bashrc.d/`, since everything in
+that directory is sourced.
+
 `plan --adopt` computes and prints the same copy, skip and line counts by
 reading, and writes nothing. The profile name is recorded as
 `ADOPTED=<name>` in `~/.claude-shared/.claude-profiles.conf`, which is what

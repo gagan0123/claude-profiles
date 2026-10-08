@@ -136,6 +136,13 @@ out=$(PATH="$T/bin:$PATH" bash -c ". $HOME/.claude-profiles.sh; claude-work --re
 check "claude-work sets CLAUDE_CONFIG_DIR and passes args" "[ \"$out\" = 'CFG=$HOME/.claude-work ARGS=--resume x' ]"
 out=$(PATH="$T/bin:$PATH" CLAUDE_CONFIG_DIR=/elsewhere bash -c ". $HOME/.claude-profiles.sh; claude mcp list")
 check "bare claude passes through when CLAUDE_CONFIG_DIR set" "[ \"$out\" = 'CFG=/elsewhere ARGS=mcp list' ]"
+# A pre-existing alias of a launcher's name, as left by a hand-made setup,
+# used to turn 'claude-personal() {' into a syntax error when sourced from an
+# interactive shell. The alias and the source line must be separate lines.
+printf 'shopt -s expand_aliases\nalias claude-personal="echo ALIAS"\nalias claude="echo ALIAS"\n. %s\nclaude-personal x\nclaude y\n' \
+  "$HOME/.claude-profiles.sh" > "$T/alias.sh"
+out=$(PATH="$T/bin:$PATH" bash "$T/alias.sh" 2>&1)
+check "launcher snippet survives aliases of the same names" "printf '%s' \"\$out\" | grep -q 'CFG=$HOME/.claude-personal ARGS=x' && printf '%s' \"\$out\" | grep -q 'Pick a profile' && ! printf '%s' \"\$out\" | grep -q 'syntax error\|ALIAS'"
 
 echo "=== apply again (idempotent, --no-backup) ==="
 n_before=$(ls "$HOME/.claude-backups"/*.tar.gz | wc -l)
@@ -165,6 +172,11 @@ check "verify flags symlinked credentials" "[ $rc -ne 0 ] && grep -q 'SYMLINK' $
 rm "$HOME/.claude-work/.credentials.json"; cp "$C/.credentials.json" "$HOME/.claude-work/.credentials.json"
 bash "$SCRIPT" verify > "$T/verify5.out" 2>&1; rc=$?
 check "verify clean after fixes" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/verify5.out"
+mkdir -p "$HOME/.bashrc.d"
+printf '# alias claude-work="commented out"\nalias claude-personal="CLAUDE_CONFIG_DIR=~/.claude-personal claude"\n' > "$HOME/.bashrc.d/claude.sh"
+bash "$SCRIPT" verify > "$T/verify-alias.out" 2>&1; rc=$?
+check "verify warns about a leftover launcher alias, without failing" "[ $rc -eq 0 ] && grep -q 'alias in $HOME/.bashrc.d/claude.sh:2: alias claude-personal=' $T/verify-alias.out && ! grep -q 'commented out' $T/verify-alias.out"
+rm -r "$HOME/.bashrc.d"
 
 echo "=== claudeMdExcludes for the ancestor ~/.claude/CLAUDE.md ==="
 PS="$HOME/.claude-personal/settings.json"

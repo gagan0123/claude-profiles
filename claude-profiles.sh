@@ -1404,10 +1404,15 @@ write_snippet() {
   hdr "Launcher functions"
   info "file: ${SNIPPET_FILE}"
 
-  # One function per profile, built up first: a heredoc cannot loop.
+  # One function per profile, built up first: a heredoc cannot loop. Each
+  # definition is preceded by an unalias: bash and zsh expand an alias of the
+  # same name while parsing 'claude-x() {', which turns the definition into a
+  # syntax error, and an alias would shadow the function anyway. The unalias
+  # must be its own command, so it is executed before the next line is parsed.
   local body funcs="" n
   for n in $PROFILES; do
-    funcs="${funcs}claude-${n}() {
+    funcs="${funcs}unalias claude-${n} 2>/dev/null || true
+claude-${n}() {
   CLAUDE_CONFIG_DIR=\"$(profile_dir "$n")\" command claude \"\$@\"
 }
 
@@ -1427,6 +1432,7 @@ ${funcs}# Guard rail: bare 'claude' would silently use ~/.claude, the untouched
 # 'claude --version', 'claude mcp ...' and similar work inside a session
 # started with $(profiles_english claude-), since the session's shell
 # inherits the variable.
+unalias claude 2>/dev/null || true
 claude() {
   if [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
     command claude "\$@"
@@ -1963,6 +1969,21 @@ do_verify() {
     warn "${rc} does not source ${SNIPPET_FILE}. Add:  . \"${SNIPPET_FILE}\""
     problems=$((problems+1))
   fi
+  # A hand-made alias from before this setup (often 'claude-personal' set to
+  # CLAUDE_CONFIG_DIR=... claude). The snippet unaliases its own names, but an
+  # alias defined after the snippet loads still shadows the launcher. Not
+  # counted as a problem: such an alias usually does the same thing.
+  local af hits
+  for af in "$rc" "$HOME/.bash_aliases" "$HOME"/.bashrc.d/* "$HOME"/.zshrc.d/*; do
+    [ -n "$af" ] && [ -f "$af" ] || continue
+    hits=$(grep -nE '^[[:space:]]*alias[[:space:]]+claude(-[A-Za-z0-9_-]+)?=' "$af" 2>/dev/null)
+    [ -n "$hits" ] || continue
+    printf '%s\n' "$hits" | while IFS= read -r line; do
+      warn "alias in ${af}:${line%%:*}: $(printf '%s' "${line#*:}" | sed 's/^[[:space:]]*//')"
+    done
+    warn "an alias overrides the launcher function of the same name when it is"
+    warn "defined after ${SNIPPET_FILE} loads. Remove or comment it out."
+  done
 
   hdr "Claude Code version"
   if [ "$CONF_LOADED" -eq 1 ]; then

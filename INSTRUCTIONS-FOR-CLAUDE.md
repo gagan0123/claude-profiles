@@ -57,7 +57,15 @@ ls -la ~/.claude.json 2>/dev/null
 echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-<unset>}"
 echo "SHELL=$SHELL"
 df -h ~ | tail -1
+ls -d ~/.claude-* 2>/dev/null
+grep -nE '^[[:space:]]*alias[[:space:]]+claude' ~/.bashrc ~/.zshrc ~/.bash_aliases ~/.bashrc.d/* ~/.zshrc.d/* 2>/dev/null
 ```
+
+An existing `~/.claude-<name>` usually means a hand-made `CLAUDE_CONFIG_DIR`
+setup, which Step 3 handles. An existing `alias claude...` line is left over
+from that setup: tell the user it will shadow the new launcher and ask to
+comment it out. If you keep a backup of a file under `~/.bashrc.d/`, put it
+somewhere else, because every file in that directory is sourced.
 
 Flag it if: the OS is not Darwin or Linux; `~/.claude` does not exist;
 `CLAUDE_CONFIG_DIR` is already set; or free disk space is less than twice the
@@ -106,6 +114,10 @@ exactly as they are. Their alternative is to move the directory aside
 themselves and merge by hand later. Re-run `plan --adopt` so they can see
 the copied/skipped counts, get explicit approval for adopting, and only then
 add `--adopt` to the Step 4 command. Do not add it on your own initiative.
+If the user wants the adopted profile to log in fresh rather than keep the
+account it holds, then after Step 4 move its `.credentials.json` into the
+`.adopted-<stamp>/` directory `apply` created. Move it; never delete it, and
+never `/logout`.
 
 **Step 4. Apply.** Only after the approval in Step 3:
 
@@ -117,6 +129,9 @@ Add `--adopt` to that command if, and only if, Step 3 turned up pre-existing
 profile data and the user approved adopting it.
 
 `--yes` is required because there is no terminal for the prompt (rule 6).
+If your permission mode refuses to run the command, do not look for another
+way to run it: give the user the exact command to run with the `!` prefix,
+and wait for its output before continuing.
 The script takes the backup first and reads it back before touching anything
 else; if the backup step dies, nothing else has been created. Confirm the
 archive path printed under `~/.claude-backups/` and tell the user. Note that

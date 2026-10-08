@@ -110,7 +110,8 @@ tests/e2e.sh
 
 It builds a fake `$HOME` under `$TMPDIR`, seeds a fake `~/.claude`, and runs
 `plan`, an `apply` without a TTY (must abort), `apply --yes --shell`, the
-launcher functions against a stub `claude` binary, a second `apply`,
+launcher functions against a stub `claude` binary (also with aliases of
+the same names already defined), a second `apply`,
 `verify` in clean and deliberately broken states, bad-input rejection,
 `rollback`, an `--adopt` run against a pre-existing fresh profile (refusal
 without the flag, archive, no-overwrite merge, history union, `.adopted-*`),
