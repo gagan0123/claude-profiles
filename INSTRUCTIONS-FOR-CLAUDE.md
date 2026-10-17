@@ -188,9 +188,10 @@ project instructions in every project under the home directory. Re-run
 had its own `claudeMdExcludes`, tell the user to add the exact path that
 the warning prints to that array by hand.
 
-Quote the "Accounts" section back to the user: it names which email each
-launched profile is actually logged in as, which is the only real proof that
-no two profiles hold the same account.
+Quote the "Accounts" section back to the user: it names which email and
+organization each launched profile is actually logged in as, which is the
+only real proof that no two profiles hold the same account. The same email
+in two different organizations is two accounts and is not flagged.
 
 **Step 7. Prove the sharing works.** In a project directory the user has used
 before, have them run `claude-work`, send one message, quit, then run

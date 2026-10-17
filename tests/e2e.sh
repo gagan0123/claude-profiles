@@ -111,6 +111,13 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   # ACCT-<word> gives a distinct identity per profile, which the
   # three-profile section needs; the two fixed tokens below predate it.
   acct=$(sed -n 's/.*"accessToken":"ACCT-\([A-Za-z0-9]*\)".*/\1/p' "$creds")
+  # SAMEMAIL-<word>: one email, a different organization per word, like
+  # a person who belongs to two orgs with the same address.
+  org=$(sed -n 's/.*"accessToken":"SAMEMAIL-\([A-Za-z0-9]*\)".*/\1/p' "$creds")
+  if [ -n "$org" ]; then
+    echo "{\"loggedIn\": true, \"authMethod\": \"claude.ai\", \"email\": \"shared@example.com\", \"orgId\": \"uuid-$org\", \"orgName\": \"Org $org\", \"subscriptionType\": \"team\"}"
+    exit 0
+  fi
   if [ -n "$acct" ]; then
     echo "{\"loggedIn\": true, \"authMethod\": \"claude.ai\", \"email\": \"$acct@example.com\", \"orgName\": \"Org $acct\", \"subscriptionType\": \"max\"}"
     exit 0
@@ -531,6 +538,18 @@ check "three: a same-account pair among three profiles is flagged" "[ $rc -ne 0 
 check "three: the warning names the pair, not the first two" "grep -q 'acme and globex are both logged in' $T/three-verify-dup.out"
 printf '{"claudeAiOauth":{"accessToken":"ACCT-globex"}}\n' > "$H6/.claude-globex/.credentials.json"
 chmod 600 "$H6/.claude-globex/.credentials.json"
+
+# One email in two different organizations is two accounts, not one.
+printf '{"claudeAiOauth":{"accessToken":"SAMEMAIL-acme"}}\n' > "$H6/.claude-acme/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"SAMEMAIL-globex"}}\n' > "$H6/.claude-globex/.credentials.json"
+HOME="$H6" bash "$SCRIPT" verify > "$T/three-verify-orgs.out" 2>&1; rc=$?
+check "three: one email in two different orgs is not flagged" "[ $rc -eq 0 ] && ! grep -qi 'same account' $T/three-verify-orgs.out && grep -q 'acme: shared@example.com (Org acme, team)' $T/three-verify-orgs.out && grep -q 'globex: shared@example.com (Org globex, team)' $T/three-verify-orgs.out"
+cp "$H6/.claude-acme/.credentials.json" "$H6/.claude-globex/.credentials.json"
+HOME="$H6" bash "$SCRIPT" verify > "$T/three-verify-orgs-dup.out" 2>&1; rc=$?
+check "three: one email in the same org is still flagged" "[ $rc -ne 0 ] && grep -q 'acme and globex are both logged in as the same account (shared@example.com, Org acme)' $T/three-verify-orgs-dup.out"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-acme"}}\n' > "$H6/.claude-acme/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"ACCT-globex"}}\n' > "$H6/.claude-globex/.credentials.json"
+chmod 600 "$H6/.claude-acme/.credentials.json" "$H6/.claude-globex/.credentials.json"
 
 # Retention has to agree across ALL of them, not just a pair.
 printf '{"cleanupPeriodDays": 7}\n' > "$H6/.claude-globex/settings.json"

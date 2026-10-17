@@ -502,7 +502,9 @@ real files or directories in each profile, never symlinks, and that nothing
 inside `~/.claude` points at the new directories. It also asks the binary
 itself, via `claude auth status --json`, which account each launched
 profile is logged into, and refuses to pass if any two profiles report the
-same account.
+same account. An account is the email *and* the organization: one email
+that belongs to two organizations is two separate logins, so profiles on
+the same email in different orgs pass.
 
 ---
 

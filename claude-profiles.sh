@@ -1550,7 +1550,7 @@ json_str() {
 
 profile_auth() {
   # $1 = profile dir. Prints one line: loggedIn<TAB>email<TAB>orgName<TAB>
-  # subscriptionType, read from `claude auth status --json` run against
+  # subscriptionType<TAB>orgId, read from `claude auth status --json` run against
   # that profile's CLAUDE_CONFIG_DIR. Prints "no-binary" instead if the
   # claude binary is not on PATH. Caller (do_verify) is responsible for
   # only calling this when profile_launched() is already true: running
@@ -1564,11 +1564,12 @@ profile_auth() {
   # A logged-out profile exits 1; that must not trip set -e here, and we
   # still want whatever JSON it printed on the way out.
   out=$(CLAUDE_CONFIG_DIR="$dir" claude auth status --json 2>/dev/null) || true
-  printf '%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\n' \
     "$(printf '%s' "$out" | json_str loggedIn)" \
     "$(printf '%s' "$out" | json_str email)" \
     "$(printf '%s' "$out" | json_str orgName)" \
-    "$(printf '%s' "$out" | json_str subscriptionType)"
+    "$(printf '%s' "$out" | json_str subscriptionType)" \
+    "$(printf '%s' "$out" | json_str orgId)"
 }
 
 points_into_new_setup() {
@@ -1583,9 +1584,9 @@ points_into_new_setup() {
   return 1
 }
 
-name_for_email() {
-  # $1 = an email, $2 = a flat "email name email name ..." list. Prints the
-  # name recorded for that email, or nothing.
+name_for_account() {
+  # $1 = an account key, $2 = a flat "key name key name ..." list. Prints
+  # the name recorded for that key, or nothing.
   local want="$1" tok cur="" want_name=0
   for tok in $2; do
     if [ "$want_name" -eq 0 ]; then
@@ -1811,11 +1812,17 @@ do_verify() {
   if ! command -v claude >/dev/null 2>&1; then
     info "'claude' is not on PATH; skipping account checks (cannot ask which account each profile holds)."
   else
-    # "email name email name ..." for every profile seen logged in so far.
-    # Each new profile is compared against that, so ANY pair sharing an
-    # account is reported, not just the first two. No arrays: emails cannot
-    # contain a space, so a flat list splits unambiguously.
-    local seen="" clash line logged email org sub
+    # "key name key name ..." for every profile seen logged in so far,
+    # where key is email|orgId. Each new profile is compared against that,
+    # so ANY pair sharing an account is reported, not just the first two.
+    # The org is part of the key because one email can belong to several
+    # organizations, each its own login with its own billing; two profiles
+    # on the same email in different orgs are separate accounts. orgId, not
+    # orgName, because a UUID cannot contain a space (the list is split on
+    # spaces, no arrays) and two orgs can share a name. A version that does
+    # not report orgId gives "unset" for everyone, which falls back to
+    # comparing emails alone.
+    local seen="" clash line logged email org sub orgid
     for name in $PROFILES; do
       dir=$(profile_dir "$name")
       [ -d "$dir" ] || continue
@@ -1828,6 +1835,7 @@ do_verify() {
       email=$(printf '%s' "$line" | cut -f2)
       org=$(printf '%s' "$line" | cut -f3)
       sub=$(printf '%s' "$line" | cut -f4)
+      orgid=$(printf '%s' "$line" | cut -f5)
       if [ "$logged" != "true" ]; then
         warn "${name}: not logged in"
         continue
@@ -1836,13 +1844,13 @@ do_verify() {
       # An absent email reads as "unset" for every profile alike, which is
       # not evidence of a shared account.
       [ "$email" = "unset" ] && continue
-      clash=$(name_for_email "$email" "$seen")
+      clash=$(name_for_account "${email}|${orgid:-unset}" "$seen")
       if [ -n "$clash" ]; then
-        warn "${clash} and ${name} are both logged in as the same account (${email})."
+        warn "${clash} and ${name} are both logged in as the same account (${email}, ${org})."
         warn "That defeats the purpose of separate profiles."
         problems=$((problems+1))
       else
-        seen="${seen}${seen:+ }${email} ${name}"
+        seen="${seen}${seen:+ }${email}|${orgid:-unset} ${name}"
       fi
     done
   fi
