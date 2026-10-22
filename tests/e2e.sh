@@ -948,6 +948,14 @@ check "statusline: a refreshInterval the user chose is kept" "[ \"\$(jq -r .stat
 printf '# stale\n' >> "$H10/.claude-shared/claude-profiles-statusline.sh"
 HOME="$H10" bash "$SCRIPT" statusline --yes > "$T/sl-update.out" 2>&1; rc=$?
 check "statusline: re-run updates a stale installed copy" "[ $rc -eq 0 ] && grep -q 'update ' $T/sl-update.out && cmp -s $SLS $H10/.claude-shared/claude-profiles-statusline.sh"
+# A profile added afterwards copies settings.json from the source, so it has
+# the source's own status line instead; add must say so, and a re-run with
+# --replace must then take the new profile over.
+HOME="$H10" bash "$SCRIPT" add slnew --yes > "$T/sl-add.out" 2>&1; rc=$?
+check "statusline: add points a new profile at the statusline command" "[ $rc -eq 0 ] && grep -q 'claude-profiles.sh statusline' $T/sl-add.out && grep -q -- '--replace' $T/sl-add.out"
+HOME="$H10" bash "$SCRIPT" statusline --yes --replace > "$T/sl-add2.out" 2>&1; rc=$?
+check "statusline: re-run after add installs it in the new profile" "[ $rc -eq 0 ] && [ \"\$(jq -r .statusLine.command $H10/.claude-slnew/settings.json)\" = '~/.claude-shared/claude-profiles-statusline.sh' ]"
+HOME="$H10" bash "$SCRIPT" remove slnew --yes > /dev/null 2>&1
 HOME="$H10" bash "$SCRIPT" statusline --yes --remove > "$T/sl-remove.out" 2>&1; rc=$?
 check "statusline: --remove takes statusLine out of both profiles" "[ $rc -eq 0 ] && ! jq -e 'has(\"statusLine\")' $H10/.claude-work/settings.json >/dev/null && ! jq -e 'has(\"statusLine\")' $H10/.claude-personal/settings.json >/dev/null"
 check "statusline: --remove deletes the script and points at the old copy" "[ ! -e $H10/.claude-shared/claude-profiles-statusline.sh ] && grep -q 'pre-statusline-' $T/sl-remove.out"

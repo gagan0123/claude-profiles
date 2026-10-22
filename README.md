@@ -241,7 +241,11 @@ named; `--replace` takes it over after copying that `settings.json` to
 `settings.json.pre-statusline-<timestamp>`. jq rewrites each file it edits
 with its own formatting. Re-run the command after pulling a newer
 checkout to update the installed copy, and after `add`, since a new
-profile does not get it automatically. `--remove` takes the setting out of
+profile does not get it automatically; `add` says so when the status line
+is installed. A new profile's `settings.json` is copied from `~/.claude`,
+so if that one names a status line of its own, the new profile needs
+`--replace`. Claude Code's built-in `/statusline` knows nothing about
+profiles, so it is no substitute here. `--remove` takes the setting out of
 every profile that uses it and deletes the installed script.
 
 ### `--json`
