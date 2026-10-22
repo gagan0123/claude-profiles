@@ -148,7 +148,8 @@ reporting broken links in both directions and a standard layout's broken
 link), and the `statusline` command (refused before `apply` and without
 a terminal, never installed by `apply`, a user's own `statusLine` left
 alone without `--replace` and backed up with it, re-run idempotent and
-updating a stale copy, `--remove`) plus `statusline.sh` itself fed JSON:
+updating a stale copy, a profile added afterwards pointed at the command
+by `add` and taken over with `--replace`, `--remove`) plus `statusline.sh` itself fed JSON:
 profile name, Remote Control from a fake session file, warning marks, PR
 link, narrow widths, `NO_COLOR`, and malformed or hostile input. The
 statusline checks are skipped when jq is not installed. It never reads or writes the real

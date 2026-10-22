@@ -2814,6 +2814,16 @@ do_add() {
   say "  2. Run each new launcher and log in with its own account when the"
   say "     browser opens. Do NOT run /logout, in any profile, at any point."
   say "  3. Run:  ./claude-profiles.sh verify"
+  # settings.json comes from the source, which statusline never edits, so a
+  # new profile has no profile-naming status line even when the others do.
+  # Say so here rather than leave it to be noticed (and patched with
+  # Claude Code's own /statusline, which knows nothing about profiles).
+  if [ -e "${SHARED}/${SL_NAME}" ]; then
+    say "  4. The other profiles use this repo's status line; the new one does"
+    say "     not yet. Run:  ./claude-profiles.sh statusline"
+    say "     (add --replace if its settings.json, copied from the source,"
+    say "     already names a status line of its own)"
+  fi
 }
 
 do_remove() {
