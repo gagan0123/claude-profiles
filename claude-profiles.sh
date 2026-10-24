@@ -97,6 +97,19 @@ SETTINGS_PAIRS=""
 # points it at the first profile when finalize has already removed the source.
 TEMPLATE_DIR=""
 
+# The user-level CLAUDE.md. "copied": one copy per profile, made once from the
+# source and then free to diverge (the original behaviour, and the default).
+# "shared": one real file at ${SHARED}/CLAUDE.md and a symlink to it in every
+# profile, so a fact fixed in one profile is fixed in all of them. Chosen with
+# --claude-md, recorded as CLAUDE_MD= in the conf file, switched later with
+# the `claude-md` command. A conf file from before this key existed means
+# "copied", which is what those versions did.
+CLAUDE_MD="copied"
+CLAUDE_MD_SET=0
+CONF_CLAUDE_MD=""
+# --from NAME for `claude-md shared`: whose copy becomes the shared file.
+FROM_ARG=""
+
 # Which options were given explicitly on the command line. Anything not given
 # explicitly falls back to the values recorded at apply time (see CONF_FILE),
 # so `verify` and `rollback` do not need the flags repeated.
@@ -424,6 +437,15 @@ Commands:
   remove NAME Archive one profile's directory to ${BACKUP_ROOT}, delete it,
               drop the name and rewrite the launchers. The shared data and
               the other profiles are not touched.
+  claude-md MODE [--from NAME]
+              Switch an existing setup between the two ways of holding the
+              user-level CLAUDE.md (see --claude-md). 'shared' archives every
+              profile's real copy to ${BACKUP_ROOT}, promotes one of them
+              (--from NAME, default the first profile) to ${SHARED}/CLAUDE.md
+              and replaces each copy with a symlink to it; 'copied' replaces
+              each symlink with a real copy of the shared file. Records the
+              choice as CLAUDE_MD= in the conf file. No dry run: without
+              --yes it prints what it would do and stops at the confirmation.
   finalize    Delete the source profile (${SOURCE}) once the new setup has
               replaced it. IRREVERSIBLE: the only way back is the tar
               archive it takes first. Runs eight gates and asks to confirm.
@@ -466,6 +488,18 @@ Options:
                     A setup whose ~/.claude-shared already resolves into
                     ~/.claude is detected as hub without the flag. Recorded
                     as LAYOUT= in the conf file. See README.md, "Hub layout".
+  --claude-md MODE  copied | shared   (default: copied, or what is recorded)
+                      copied = each profile gets its own copy of the
+                               source's CLAUDE.md once, free to diverge
+                      shared = one file, ${SHARED}/CLAUDE.md, copied once
+                               from the source; every profile's CLAUDE.md
+                               is a symlink to it, so a fix made in one
+                               profile reaches all of them
+                    Recorded as CLAUDE_MD= in the conf file. On a setup that
+                    already exists, a different value is refused: switch
+                    with the 'claude-md' command instead.
+  --from NAME       with 'claude-md shared': the profile whose CLAUDE.md
+                    becomes the shared file (default: the first profile).
   --source DIR      profile to seed from (default: ${SOURCE})
   --settings NAME=PATH
                     seed that one profile's settings.json from PATH instead
@@ -511,9 +545,10 @@ With none of --profiles/--main/--second and no conf file, plan and apply ask
 at the terminal which profiles you want, offering the default pair. Without a
 terminal, or with --yes, they take the default silently.
 
-After a successful apply, --profiles/--share/--source are remembered in
-~/.claude-shared/.claude-profiles.conf, so verify and rollback do not need
-them repeated. Explicit flags always win over the remembered values.
+After a successful apply, --profiles/--share/--layout/--claude-md/--source
+are remembered in ~/.claude-shared/.claude-profiles.conf, so verify and
+rollback do not need them repeated. Explicit flags always win over the
+remembered values.
 
 Examples:
   ./claude-profiles.sh plan
@@ -539,6 +574,15 @@ case "${1:-}" in
       ""|-*) die "'${CMD}' needs a profile name, e.g. ./claude-profiles.sh ${CMD} clientx" ;;
     esac
     CMD_ARG="$1"; shift ;;
+  claude-md)
+    # `claude-md shared|copied`: the mode is positional, like add's name, so
+    # that it cannot be confused with --claude-md, which is the apply-time
+    # choice that this command exists to change.
+    CMD="$1"; shift
+    case "${1:-}" in
+      shared|copied) CMD_ARG="$1"; shift ;;
+      *) die "'claude-md' needs 'shared' or 'copied', e.g. ./claude-profiles.sh claude-md shared" ;;
+    esac ;;
   -h|--help) usage; exit 0 ;;
   *) die "unknown command '${1}'. Try --help." ;;
 esac
@@ -551,6 +595,14 @@ while [ $# -gt 0 ]; do
     --second) SECOND_ARG="${2:?--second needs a name}"; SECOND_SET=1; shift 2 ;;
     --share)  SHARE_MODE="${2:?--share needs full or safe}"; SHARE_SET=1; shift 2 ;;
     --layout) LAYOUT="${2:?--layout needs standard or hub}"; LAYOUT_SET=1; shift 2 ;;
+    --claude-md)
+      [ "$CMD" != "claude-md" ] \
+        || die "'claude-md' takes its mode as a positional argument, not --claude-md:
+       ./claude-profiles.sh claude-md ${2:-shared}"
+      CLAUDE_MD="${2:?--claude-md needs shared or copied}"; CLAUDE_MD_SET=1; shift 2 ;;
+    --from)
+      [ "$CMD" = "claude-md" ] || die "--from is only accepted by claude-md, not '${CMD}'."
+      FROM_ARG="${2:?--from needs a profile name}"; shift 2 ;;
     --source) SOURCE="${2:?--source needs a path}"; SOURCE_SET=1; shift 2 ;;
     --settings)
       # NAME=PATH. The name and the file are checked later, against the
@@ -627,6 +679,8 @@ if [ -f "$CONF_FILE" ]; then
       ADOPTED)    CONF_ADOPTED="$v" ;;
       LAYOUT)     CONF_LAYOUT="$v"
                   if [ "$LAYOUT_SET" -eq 0 ]; then LAYOUT="$v"; fi ;;
+      CLAUDE_MD)  CONF_CLAUDE_MD="$v"
+                  if [ "$CLAUDE_MD_SET" -eq 0 ]; then CLAUDE_MD="$v"; fi ;;
     esac
   done < "$CONF_FILE"
   CONF_LOADED=1
@@ -644,6 +698,10 @@ esac
 case "$LAYOUT" in
   standard|hub) ;;
   *) die "--layout must be 'standard' or 'hub', got '${LAYOUT}'" ;;
+esac
+case "$CLAUDE_MD" in
+  shared|copied) ;;
+  *) die "--claude-md must be 'shared' or 'copied', got '${CLAUDE_MD}'" ;;
 esac
 
 # -- which profiles this run is about ----------------------------------------
@@ -757,6 +815,22 @@ if [ "$LAYOUT" = "hub" ] || [ "$HUB_DETECTED" -eq 1 ]; then
        writes existing data into ${HUB}. Move the profile directory aside, or
        merge it by hand (README.md, 'Hub layout')."
   fi
+  # A shared CLAUDE.md is a real file in ${SHARED} (see seed_claude_md for
+  # why it is never a link into the hub). When ${SHARED} is itself one link
+  # to ${HUB} there is nowhere to put that file except ${HUB}/CLAUDE.md, the
+  # ancestor every profile excludes, so the shared mode cannot be had there.
+  _want_shared=0
+  case "$CMD" in
+    plan|apply|add) [ "$CLAUDE_MD" = "shared" ] && _want_shared=1 ;;
+    claude-md)      [ "$CMD_ARG" = "shared" ] && _want_shared=1 ;;
+  esac
+  if [ "$HUB_WHOLE" -eq 1 ] && [ "$_want_shared" -eq 1 ]; then
+    die "--claude-md shared is not possible while ${SHARED} is itself a link to
+       ${HUB}: the shared CLAUDE.md would be ${HUB}/CLAUDE.md, the file every
+       profile lists in claudeMdExcludes. Use a ${SHARED} that is a directory
+       of links (README.md, 'Hub layout'), or keep --claude-md copied."
+  fi
+  unset _want_shared
 fi
 
 for d in $PROFILES; do
@@ -790,6 +864,7 @@ preflight() {
   # Before anything is read, copied or archived: a bad --settings pair is a
   # typo in the command line, and plan and apply should both die on it here.
   settings_check "$PROFILES"
+  claude_md_check
 
   if [ ! -d "$SOURCE" ]; then
     # After finalize the source is gone on purpose, and the generic "does not
@@ -828,6 +903,15 @@ preflight() {
     ok "app state found: ${SRC_STATE}"
   else
     info "no .claude.json found for the source profile (fresh install?)"
+  fi
+
+  if [ "$CLAUDE_MD" = "shared" ]; then
+    info "CLAUDE.md: shared (--claude-md shared). One file, ${SHARED}/CLAUDE.md,"
+    info "copied once from the source; every profile's CLAUDE.md links to it."
+  else
+    info "CLAUDE.md: copied (--claude-md copied, the default). Each profile gets"
+    info "its own copy once, free to diverge. --claude-md shared keeps the file"
+    info "identical across profiles instead."
   fi
 
   if command -v claude >/dev/null 2>&1; then
@@ -1055,6 +1139,7 @@ seed_shared() {
       esac
     fi
   done
+  seed_claude_md
 }
 
 hub_entry() {
@@ -1134,6 +1219,79 @@ seed_shared_hub() {
     info "link   ${p} -> ${h}"
     run ln -s "$h" "$s"
   done
+  seed_claude_md
+}
+
+seed_claude_md() {
+  # --claude-md shared: the one real CLAUDE.md, ${SHARED}/CLAUDE.md, copied
+  # once from the template (the source, or the first profile when `add` runs
+  # after finalize) through the same .partial-then-rename as the shared data
+  # paths, never overwritten. A source without one gets an empty file, so
+  # that the profiles' links always resolve.
+  #
+  # Hub layout: this is a real copy, deliberately NOT a link into ${HUB} like
+  # the other shared entries. ${HUB}/CLAUDE.md is the ancestor file that every
+  # profile names in claudeMdExcludes, because with CLAUDE_CONFIG_DIR set it
+  # loads as project instructions in every project under $HOME. A profile
+  # whose own CLAUDE.md resolved to that same path would have its user file
+  # be the file it excludes, and whether claudeMdExcludes matches the spelled
+  # path or the resolved one is not documented; a user file that could
+  # silently vanish is not acceptable. A separate copy keeps the hub rule
+  # intact (cp from ${HUB} is a read; nothing there is touched) and leaves
+  # ${HUB}/CLAUDE.md to Claude Desktop, which reads it as its own user file.
+  # The two can drift, exactly as the per-profile copies could before.
+  [ "$CLAUDE_MD" = "shared" ] || return 0
+  local src dst tmp
+  src="${TEMPLATE_DIR:-$SOURCE}/CLAUDE.md"
+  dst="${SHARED}/CLAUDE.md"
+  tmp="${SHARED}/.CLAUDE.md.partial"
+  hdr "Shared CLAUDE.md: ${dst}"
+  if [ -L "$dst" ] || [ -e "$dst" ]; then
+    if [ -L "$dst" ]; then info "keep   CLAUDE.md -> $(readlink "$dst") (already in shared dir, left alone)"
+    else info "keep   CLAUDE.md (already in shared dir, left alone)"; fi
+    return 0
+  fi
+  if [ -e "$tmp" ]; then
+    info "clean  CLAUDE.md (stale partial copy from an interrupted run)"
+    run rm -f "$tmp"
+  fi
+  if [ -f "$src" ]; then
+    info "seed   CLAUDE.md <- ${src}"
+    run cp -p "$src" "$tmp"
+    run mv "$tmp" "$dst"
+  else
+    info "create CLAUDE.md (empty, ${src} does not exist)"
+    run touch "$dst"
+  fi
+}
+
+claude_md_check() {
+  # Run by preflight (plan, apply) and by add, before anything is written.
+  # Two refusals. A --claude-md that differs from what the conf file records
+  # must not silently half-convert a setup: with "shared" on a copied setup,
+  # make_profile would keep every existing real copy and only seed the shared
+  # file; with "copied" on a shared one it would keep every link. The
+  # claude-md command does the conversion properly. And ${SHARED}/CLAUDE.md
+  # may never be a link into the hub (see seed_claude_md).
+  local dst="${SHARED}/CLAUDE.md" rec
+  if [ -n "$CONF_CLAUDE_MD" ]; then rec="records CLAUDE_MD=${CONF_CLAUDE_MD}"
+  else rec="has no CLAUDE_MD line, which older versions did not write: that means copied"; fi
+  if [ "$CONF_LOADED" -eq 1 ] && [ "$CLAUDE_MD_SET" -eq 1 ] \
+     && [ "$CLAUDE_MD" != "${CONF_CLAUDE_MD:-copied}" ]; then
+    die "--claude-md ${CLAUDE_MD}, but ${CONF_FILE} ${rec}.
+       apply does not convert an existing setup from one to the other, because
+       it never replaces a CLAUDE.md that is already there. To switch, run:
+         ./claude-profiles.sh claude-md ${CLAUDE_MD}
+       which archives the profiles' copies first. Nothing was changed."
+  fi
+  if [ "$CLAUDE_MD" = "shared" ] && [ -L "$dst" ] && points_at_hub "$dst"; then
+    die "${dst} is a link into ${HUB} (-> $(readlink "$dst")). The shared CLAUDE.md
+       has to be a real file: ${HUB}/CLAUDE.md is the ancestor file every
+       profile lists in claudeMdExcludes, so a profile whose own CLAUDE.md
+       resolved to it could have its user instructions excluded. Remove that
+       link (nothing in ${HUB} is affected) and re-run; apply then copies the
+       file in. Nothing was changed."
+  fi
 }
 
 adopted_value() {
@@ -1152,7 +1310,7 @@ adopted_value() {
 
 write_conf() {
   if [ "$DRY" -eq 1 ]; then
-    info "would record PROFILES/SHARE_MODE/LAYOUT/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
+    info "would record PROFILES/SHARE_MODE/LAYOUT/CLAUDE_MD/SOURCE/CLAUDE_VERSION/ADOPTED in ${CONF_FILE}"
     return 0
   fi
   # PROFILES= replaces the MAIN=/SECOND= pair older versions wrote; the
@@ -1162,6 +1320,7 @@ write_conf() {
     printf 'PROFILES=%s\n'   "$(profiles_csv)"
     printf 'SHARE_MODE=%s\n' "$SHARE_MODE"
     printf 'LAYOUT=%s\n'     "$LAYOUT"
+    printf 'CLAUDE_MD=%s\n'  "$CLAUDE_MD"
     printf 'SOURCE=%s\n'     "$SOURCE"
     printf 'CLAUDE_VERSION=%s\n' "$(claude_version)"
     printf 'ADOPTED=%s\n'    "$(adopted_value)"
@@ -1559,7 +1718,30 @@ make_profile() {
     src="${tmpl}/${p}"
     seed=""
     if [ "$p" = "settings.json" ]; then seed=$(settings_for "$label"); fi
-    if [ -e "${dir}/${p}" ]; then
+    if [ "$p" = "CLAUDE.md" ] && [ "$CLAUDE_MD" = "shared" ]; then
+      # One link per profile to the shared file seed_claude_md made. A real
+      # file already there is never replaced here: that is what the claude-md
+      # command does, after archiving it. A link elsewhere is left and
+      # reported; verify flags both.
+      if [ -L "${dir}/${p}" ]; then
+        if [ "$(readlink "${dir}/${p}")" = "${SHARED}/${p}" ]; then
+          info "link   ${p} (already linked)"
+        else
+          warn "'${dir}/${p}' points at '$(readlink "${dir}/${p}")', not ${SHARED}/${p}."
+          warn "Left alone. Remove that link and re-run apply, or 'verify' explains."
+        fi
+      elif [ -e "${dir}/${p}" ]; then
+        warn "'${dir}/${p}' is a real file, but CLAUDE.md is shared. Left alone:"
+        warn "run  ./claude-profiles.sh claude-md shared  to archive and link it."
+      else
+        info "link   ${p} -> ${SHARED}/${p}"
+        run ln -s "${SHARED}/${p}" "${dir}/${p}"
+      fi
+      continue
+    fi
+    # -L as well as -e: a dangling link is "present" too, and cp through it
+    # would create the target rather than replace the link.
+    if [ -e "${dir}/${p}" ] || [ -L "${dir}/${p}" ]; then
       if [ -n "$seed" ]; then
         # Idempotence wins: --settings seeds a profile, it does not overwrite
         # one. Saying so is the point, or a re-apply would look like it took.
@@ -1960,7 +2142,7 @@ do_verify() {
     info "skipped: ${SOURCE} was removed by finalize on ${CONF_FINALIZED}."
     info "There is no source profile left to leave untouched."
   else
-    for p in $SHARE_ALL $PRIVATE; do
+    for p in $SHARE_ALL $PRIVATE CLAUDE.md; do
       if [ -L "${SOURCE}/${p}" ] && points_into_new_setup "$(readlink "${SOURCE}/${p}")"; then
         warn "${SOURCE}/${p} is a symlink INTO the new setup. The script never does this."
         touched=1
@@ -2239,6 +2421,94 @@ do_verify() {
     ok "no ${ANCESTOR_MD}, nothing to exclude"
   fi
 
+  hdr "CLAUDE.md"
+  # Per the recorded mode (or --claude-md). shared: ${SHARED}/CLAUDE.md is a
+  # real file and every profile's CLAUDE.md is a link to exactly that path.
+  # copied: every profile's CLAUDE.md is a real file (a missing one is fine:
+  # the source may never have had one). A broken or wrong-target link is a
+  # problem in either mode; a real file in shared mode is only a warning,
+  # because the profile still works, it just no longer follows the others.
+  local md_dst="${SHARED}/CLAUDE.md" md_bad=0 md_real=0 md_t
+  if [ "$CONF_LOADED" -eq 1 ]; then
+    info "mode: ${CLAUDE_MD} (${CONF_FILE}: CLAUDE_MD=${CONF_CLAUDE_MD:-unset, treated as copied})"
+  else
+    info "mode: ${CLAUDE_MD} (no ${CONF_FILE}; the default, or --claude-md)"
+  fi
+  if [ "$CLAUDE_MD" = "shared" ]; then
+    if [ "$HUB_WHOLE" -eq 1 ]; then
+      warn "${SHARED} is itself a link to ${HUB}, so the shared CLAUDE.md would be"
+      warn "${HUB}/CLAUDE.md, the file every profile excludes. Not supported;"
+      warn "run  ./claude-profiles.sh claude-md copied"
+      md_bad=$((md_bad+1))
+    elif [ -L "$md_dst" ] && points_at_hub "$md_dst"; then
+      warn "${md_dst} is a link into ${HUB} (-> $(readlink "$md_dst")), the ancestor"
+      warn "file every profile excludes. It must be a real file: remove the link"
+      warn "and re-run apply, which copies the file in."
+      md_bad=$((md_bad+1))
+    elif [ -L "$md_dst" ] && [ ! -e "$md_dst" ]; then
+      warn "${md_dst} is a broken link (-> $(readlink "$md_dst"))."
+      md_bad=$((md_bad+1))
+    elif [ ! -f "$md_dst" ]; then
+      warn "missing: ${md_dst}. Re-run apply (it seeds the file from the source),"
+      warn "or  ./claude-profiles.sh claude-md shared --from NAME  to promote a copy."
+      md_bad=$((md_bad+1))
+    else
+      ok "${md_dst} is the one real file"
+    fi
+    for name in $PROFILES; do
+      dir=$(profile_dir "$name")
+      [ -d "$dir" ] || continue
+      if [ -L "${dir}/CLAUDE.md" ]; then
+        md_t=$(readlink "${dir}/CLAUDE.md")
+        if [ "$md_t" != "$md_dst" ]; then
+          warn "${name}: CLAUDE.md points at '${md_t}', expected '${md_dst}'"
+          md_bad=$((md_bad+1))
+        elif [ ! -e "${dir}/CLAUDE.md" ]; then
+          warn "${name}: CLAUDE.md is a dangling link: '${md_dst}' does not exist"
+          md_bad=$((md_bad+1))
+        else
+          ok "${name}: CLAUDE.md -> ${md_dst}"
+        fi
+      elif [ -e "${dir}/CLAUDE.md" ]; then
+        warn "${name}: CLAUDE.md is a real file, not a link to ${md_dst}. Edits"
+        warn "there reach no other profile. Fix:  ./claude-profiles.sh claude-md shared"
+        md_real=1
+      else
+        warn "${name}: CLAUDE.md is missing. Re-run apply to link it."
+        md_bad=$((md_bad+1))
+      fi
+    done
+  else
+    for name in $PROFILES; do
+      dir=$(profile_dir "$name")
+      [ -d "$dir" ] || continue
+      if [ -L "${dir}/CLAUDE.md" ]; then
+        md_t=$(readlink "${dir}/CLAUDE.md")
+        if [ "$md_t" = "$md_dst" ] && [ -e "${dir}/CLAUDE.md" ]; then
+          warn "${name}: CLAUDE.md is a link to ${md_dst}, but the recorded mode is"
+          warn "copied. Run  ./claude-profiles.sh claude-md shared  to record the"
+          warn "shared mode (links kept), or  claude-md copied  to replace the link"
+          warn "with a copy."
+        elif [ ! -e "${dir}/CLAUDE.md" ]; then
+          warn "${name}: CLAUDE.md is a dangling link (-> ${md_t})"
+        else
+          warn "${name}: CLAUDE.md is a link (-> ${md_t}), expected a real file"
+        fi
+        md_bad=$((md_bad+1))
+      elif [ -e "${dir}/CLAUDE.md" ]; then
+        ok "${name}: CLAUDE.md is its own copy"
+      else
+        info "${name}: no CLAUDE.md (the source had none at setup; fine)"
+      fi
+    done
+  fi
+  if [ "$md_bad" -gt 0 ]; then
+    problems=$((problems+md_bad))
+  elif [ "$md_real" -eq 1 ]; then
+    info "not counted as a problem: the profile works, it just does not follow"
+    info "the shared file. claude-md shared archives the copy before linking."
+  fi
+
   hdr "Settings that still point at ${SOURCE}"
   local refs=0 extra
   for name in $PROFILES; do
@@ -2445,6 +2715,11 @@ do_status() {
     trans_count=0
   fi
   info "size: $(kb_h "$shared_kb")   projects: ${proj_count}   transcripts: ${trans_count}   mode: ${SHARE_MODE}"
+  if [ "$CLAUDE_MD" = "shared" ]; then
+    info "CLAUDE.md: shared (${SHARED}/CLAUDE.md, linked from every profile)"
+  else
+    info "CLAUDE.md: copied (one copy per profile)"
+  fi
 
   hdr "Backups"
   local backup_count=0 backup_latest="" backup_latest_json="null"
@@ -2477,10 +2752,10 @@ do_status() {
   fi
 
   if [ "$JSON" -eq 1 ]; then
-    printf '{"command":"status","version":"%s","claude_version":"%s","current_profile":%s,"profiles":[%s],"shared":{"dir":"%s","mode":"%s","size_kb":%s,"projects":%s,"transcripts":%s},"backups":{"count":%s,"latest":%s},"finalized":%s,"adopted":%s}\n' \
+    printf '{"command":"status","version":"%s","claude_version":"%s","current_profile":%s,"profiles":[%s],"shared":{"dir":"%s","mode":"%s","claude_md":"%s","size_kb":%s,"projects":%s,"transcripts":%s},"backups":{"count":%s,"latest":%s},"finalized":%s,"adopted":%s}\n' \
       "$(json_esc "$VERSION")" "$(json_esc "$cur")" "$current_profile_json" \
       "$json_profiles" \
-      "$(json_esc "$SHARED")" "$(json_esc "$SHARE_MODE")" "$shared_kb" "$proj_count" "$trans_count" \
+      "$(json_esc "$SHARED")" "$(json_esc "$SHARE_MODE")" "$(json_esc "$CLAUDE_MD")" "$shared_kb" "$proj_count" "$trans_count" \
       "$backup_count" "$backup_latest_json" \
       "$finalized_json" "$adopted_json"
   fi
@@ -2509,6 +2784,11 @@ do_rollback() {
   else
     warn "Any conversations you had ONLY under the new profiles live in"
     warn "${SHARED} and will be lost. Copy them out first if you want them."
+  fi
+  if [ -f "${SHARED}/CLAUDE.md" ] && [ ! -L "${SHARED}/CLAUDE.md" ]; then
+    warn "${SHARED}/CLAUDE.md is the one real copy of the shared CLAUDE.md and"
+    warn "goes with the directory; the profiles' entries are links to it. The"
+    warn "copies from before 'claude-md shared' are in ${BACKUP_ROOT}/claude-md-*.tar.gz."
   fi
 
   local d
@@ -2698,6 +2978,272 @@ rewrite_conf_key() {
   mv "$tmp" "$CONF_FILE"
 }
 
+# ------------------------------------------------- claude-md: switch mode --
+#
+# `claude-md shared|copied` converts a setup that already exists between the
+# two ways of holding the user-level CLAUDE.md (see CLAUDE_MD at the top).
+# apply never does this conversion, because it never replaces a CLAUDE.md
+# that is already in a profile; this command does, after archiving every
+# real copy to ${BACKUP_ROOT}. It has no dry run of its own: everything it
+# will do is printed before the single confirmation, so a run without --yes
+# is the preview, as with finalize. The writes still go through run().
+
+claude_md_state() {
+  # $1 = profile dir. One word for its CLAUDE.md: "linked" (a link to
+  # ${SHARED}/CLAUDE.md that resolves), "dangling" (that link, target gone),
+  # "elsewhere" (a link to anything else), "real" (a regular file), "other"
+  # (exists but is neither, e.g. a directory), or "missing".
+  local f="$1/CLAUDE.md"
+  if [ -L "$f" ]; then
+    if [ "$(readlink "$f")" != "${SHARED}/CLAUDE.md" ]; then printf 'elsewhere'
+    elif [ -e "$f" ]; then printf 'linked'
+    else printf 'dangling'; fi
+  elif [ -f "$f" ]; then printf 'real'
+  elif [ -e "$f" ]; then printf 'other'
+  else printf 'missing'; fi
+}
+
+do_claude_md() {
+  local want="$1" dst="${SHARED}/CLAUDE.md" tmp="${SHARED}/.CLAUDE.md.partial"
+  local name dir st from from_file archive st_rc=0
+  local n_real=0 n_todo=0 differ=0 ref ref_label lines files=""
+
+  [ "$CONF_LOADED" -eq 1 ] \
+    || die "no ${CONF_FILE}: there is no recorded setup whose CLAUDE.md to switch.
+       Run 'apply' first; it takes --claude-md shared|copied to choose up front."
+  [ -d "$SHARED" ] || die "${CONF_FILE} exists but '${SHARED}' does not. Run 'apply' first."
+
+  hdr "CLAUDE.md: switch to ${want}"
+  info "recorded now: CLAUDE_MD=${CONF_CLAUDE_MD:-unset (an older conf file: copied)}"
+  say "  ${SOURCE} is not touched by this command."
+
+  # Both directions refuse the states they cannot convert, before anything
+  # is written: a link to somewhere other than the shared file, or an entry
+  # that is neither a file nor a link, is somebody's hand-made arrangement.
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    [ -d "$dir" ] || continue
+    st=$(claude_md_state "$dir")
+    case "$st" in
+      elsewhere)
+        die "${name}: ${dir}/CLAUDE.md is a link to '$(readlink "${dir}/CLAUDE.md")', not to
+       ${dst}. This command only converts between a real copy and a link to
+       the shared file. Remove or fix that link by hand, then run it again.
+       Nothing was changed." ;;
+      other)
+        die "${name}: ${dir}/CLAUDE.md is neither a regular file nor a link. Not
+       something this command converts. Nothing was changed." ;;
+    esac
+  done
+
+  if [ "$want" = "shared" ]; then
+    if [ -L "$dst" ] && points_at_hub "$dst"; then
+      die "${dst} is a link into ${HUB} (-> $(readlink "$dst")), the ancestor file
+       every profile excludes via claudeMdExcludes. The shared CLAUDE.md must
+       be a real file; remove that link (nothing in ${HUB} is affected) and
+       run again. Nothing was changed."
+    fi
+    if [ -L "$dst" ] && [ ! -e "$dst" ]; then
+      die "${dst} is a broken link (-> $(readlink "$dst")). Remove it and run again.
+       Nothing was changed."
+    fi
+    from="${FROM_ARG:-$(first_profile)}"
+    in_list "$from" "$PROFILES" \
+      || die "--from '${from}' is not one of the profiles ($(profiles_csv))."
+    from_file="$(profile_dir "$from")/CLAUDE.md"
+
+    # What the shared text will be: the existing shared file if there is one
+    # (then --from's copy must agree with it, or neither is overwritten),
+    # otherwise --from's own real copy.
+    if [ -f "$dst" ] && [ ! -L "$dst" ]; then
+      ref="$dst"; ref_label="${dst}"
+      if [ -f "$from_file" ] && [ ! -L "$from_file" ] && ! cmp -s "$from_file" "$dst"; then
+        die "${dst} already exists and differs from ${from_file} (--from ${from}).
+       Neither is overwritten. Decide which text is right and make the two
+       identical, or move ${dst} aside so that '${from}'s copy is promoted,
+       then run again. Nothing was changed."
+      fi
+      info "shared file: ${dst} already exists and stays as it is"
+    elif [ -f "$dst" ]; then
+      # A link that resolves to a regular file somewhere else. Kept.
+      ref="$dst"; ref_label="${dst} (-> $(readlink "$dst"))"
+      info "shared file: ${dst} is a link to $(readlink "$dst"); kept"
+    else
+      if [ ! -f "$from_file" ] || [ -L "$from_file" ]; then
+        die "'${from}' has no CLAUDE.md of its own to promote (${from_file} is
+       not a regular file) and ${dst} does not exist yet. Pass --from NAME
+       naming a profile whose CLAUDE.md should become the shared one.
+       Nothing was changed."
+      fi
+      ref="$from_file"; ref_label="${from}'s copy"
+      info "shared file: ${dst} <- ${from_file} (--from ${from})"
+    fi
+
+    for name in $PROFILES; do
+      dir=$(profile_dir "$name")
+      [ -d "$dir" ] || { info "${name}: ${dir} does not exist, skipped"; continue; }
+      st=$(claude_md_state "$dir")
+      case "$st" in
+        linked)   info "${name}: already a link to ${dst}; nothing to do" ;;
+        dangling) info "${name}: a link to ${dst} that resolves once the shared file exists" ;;
+        missing)  info "${name}: no CLAUDE.md; it gets the link"; n_todo=$((n_todo+1)) ;;
+        real)
+          n_real=$((n_real+1)); n_todo=$((n_todo+1))
+          files="${files}${files:+ }${name}"
+          lines=$(wc -l < "${dir}/CLAUDE.md" | tr -d ' ')
+          if cmp -s "${dir}/CLAUDE.md" "$ref"; then
+            info "${name}: real copy, ${lines} line(s), identical to ${ref_label}"
+          else
+            differ=1
+            info "${name}: real copy, ${lines} line(s), DIFFERS from ${ref_label} ($(wc -l < "$ref" | tr -d ' ') line(s))"
+          fi ;;
+      esac
+    done
+
+    if [ "$n_todo" -eq 0 ] && [ -f "$dst" ]; then
+      # The hand-made case: every profile already links to an existing shared
+      # file. Only the record changes, so there is nothing to confirm.
+      rewrite_conf_key CLAUDE_MD shared
+      ok "every profile already links to ${dst}; recorded CLAUDE_MD=shared in ${CONF_FILE}"
+      return 0
+    fi
+
+    archive="${BACKUP_ROOT}/claude-md-${RUN_STAMP}.tar.gz"
+    say ""
+    if [ "$n_real" -gt 0 ]; then
+      say "  archive first : ${archive}"
+      say "                  (the ${n_real} real cop$( [ "$n_real" -eq 1 ] && printf 'y' || printf 'ies' ) above: ${files}; mode 600 in a mode 700 directory)"
+    fi
+    [ -f "$dst" ] || say "  then          : ${dst} <- ${from_file}"
+    say "  then          : each real copy becomes a link to ${dst}"
+    say "  then          : ${CONF_FILE} records CLAUDE_MD=shared"
+    if [ "$differ" -eq 1 ]; then
+      warn "the copies differ. Only ${ref_label} survives as the text every"
+      warn "profile reads; the others are kept in the archive and nowhere else."
+      warn "Diff them first if in doubt: diff ${from_file} <other profile>/CLAUDE.md"
+    fi
+    confirm "Switch CLAUDE.md to shared as listed above?" || { say "aborted: nothing was changed."; return 1; }
+
+    if [ "$n_real" -gt 0 ]; then
+      hdr "Archive"
+      # tar operands as positional parameters: the one list bash 3.2 has.
+      set --
+      for name in $files; do
+        dir=$(profile_dir "$name")
+        set -- "$@" -C "$(dirname "$dir")" "$(basename "$dir")/CLAUDE.md"
+      done
+      info "archive:  ${archive}"
+      info "contents: $(for name in $files; do printf '%s ' "$(profile_dir "$name")/CLAUDE.md"; done)"
+      archive_tree "$archive" "$@" || st_rc=$?
+      if [ "$st_rc" -eq 90 ]; then
+        die "the archive does not read back cleanly: ${archive}. Nothing converted."
+      elif [ "$st_rc" -ne 0 ]; then
+        die "the archive FAILED (tar exit ${st_rc}). See ${archive}.log. Nothing converted."
+      fi
+      ok "archive written and read back ($(du -sh "$archive" | cut -f1))"
+    fi
+
+    hdr "Shared file"
+    if [ -f "$dst" ]; then
+      info "keep   ${dst}"
+    else
+      [ -e "$tmp" ] && run rm -f "$tmp"
+      info "promote ${from_file} -> ${dst}"
+      run cp -p "$from_file" "$tmp"
+      run mv "$tmp" "$dst"
+    fi
+
+    hdr "Profiles"
+    for name in $PROFILES; do
+      dir=$(profile_dir "$name")
+      [ -d "$dir" ] || continue
+      case "$(claude_md_state "$dir")" in
+        real)
+          info "${name}: replace the copy with a link -> ${dst}"
+          run rm -f "${dir}/CLAUDE.md"
+          run ln -s "$dst" "${dir}/CLAUDE.md" ;;
+        missing)
+          info "${name}: link -> ${dst}"
+          run ln -s "$dst" "${dir}/CLAUDE.md" ;;
+        *) info "${name}: already linked" ;;
+      esac
+    done
+    rewrite_conf_key CLAUDE_MD shared
+    ok "recorded CLAUDE_MD=shared in ${CONF_FILE}"
+
+    hdr "Done"
+    say "  Every profile now reads ${dst}; edit it from any of them."
+    if [ "$n_real" -gt 0 ]; then
+      say "  The copies from before are in ${archive}"
+      say "  (ROLLBACK.md, 'Undoing claude-md shared')."
+    fi
+    return 0
+  fi
+
+  # -- copied -----------------------------------------------------------------
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    [ -d "$dir" ] || { info "${name}: ${dir} does not exist, skipped"; continue; }
+    st=$(claude_md_state "$dir")
+    case "$st" in
+      linked)   info "${name}: link -> ${dst}; becomes its own copy"; n_todo=$((n_todo+1)) ;;
+      dangling) info "${name}: dangling link to ${dst}, which does not exist; the link is removed"
+                n_todo=$((n_todo+1)) ;;
+      real)     info "${name}: already its own copy; nothing to do" ;;
+      missing)
+        if [ -f "$dst" ]; then
+          info "${name}: no CLAUDE.md; it gets a copy of ${dst}"; n_todo=$((n_todo+1))
+        else
+          info "${name}: no CLAUDE.md, and no ${dst} to copy; left without one"
+        fi ;;
+    esac
+  done
+
+  if [ "$n_todo" -eq 0 ]; then
+    rewrite_conf_key CLAUDE_MD copied
+    ok "every profile already has its own copy; recorded CLAUDE_MD=copied in ${CONF_FILE}"
+    return 0
+  fi
+
+  say ""
+  say "  each link above is replaced by a real copy of ${dst} (cp -p, through a"
+  say "  temp file, so an interrupted run leaves either the link or the copy)."
+  say "  ${CONF_FILE} then records CLAUDE_MD=copied."
+  if [ -f "$dst" ]; then
+    say "  ${dst} stays where it is: harmless, nothing reads it once no link"
+    say "  points at it. Delete it by hand if you want."
+  fi
+  confirm "Switch CLAUDE.md to copied as listed above?" || { say "aborted: nothing was changed."; return 1; }
+
+  hdr "Profiles"
+  for name in $PROFILES; do
+    dir=$(profile_dir "$name")
+    [ -d "$dir" ] || continue
+    case "$(claude_md_state "$dir")" in
+      linked)
+        info "${name}: copy ${dst} -> ${dir}/CLAUDE.md (replacing the link)"
+        run cp -p "$dst" "${dir}/.CLAUDE.md.partial"
+        run mv "${dir}/.CLAUDE.md.partial" "${dir}/CLAUDE.md" ;;
+      dangling)
+        info "${name}: remove the dangling link"
+        run rm -f "${dir}/CLAUDE.md" ;;
+      missing)
+        [ -f "$dst" ] || continue
+        info "${name}: copy ${dst} -> ${dir}/CLAUDE.md"
+        run cp -p "$dst" "${dir}/.CLAUDE.md.partial"
+        run mv "${dir}/.CLAUDE.md.partial" "${dir}/CLAUDE.md" ;;
+      *) info "${name}: already its own copy" ;;
+    esac
+  done
+  rewrite_conf_key CLAUDE_MD copied
+  ok "recorded CLAUDE_MD=copied in ${CONF_FILE}"
+
+  hdr "Done"
+  say "  Each profile has its own CLAUDE.md again, free to diverge."
+  [ -f "$dst" ] && say "  ${dst} is still there and unused; delete it by hand if you want."
+  return 0
+}
+
 do_add() {
   # $1 = NAME[,NAME...]. Each new profile is created exactly as apply creates
   # a fresh, non-inheriting one: the CONFIG_COPIED files, then
@@ -2781,6 +3327,7 @@ do_add() {
   TEMPLATE_DIR="$from"
 
   settings_check "$new"
+  claude_md_check
 
   csv=$(printf '%s' "$new" | tr ' ' ',')
   say ""
@@ -2789,11 +3336,18 @@ do_add() {
     say "    $(profile_dir "$n")     (claude-${n}, starts logged out)"
   done
   say "  ${SHARED} is only linked to, never copied again."
+  if [ "$CLAUDE_MD" = "shared" ]; then
+    say "  CLAUDE.md is shared (CLAUDE_MD=shared): each new profile links to"
+    say "  ${SHARED}/CLAUDE.md instead of getting a copy."
+  fi
   say "  ${CONF_FILE} and ${SNIPPET_FILE} are rewritten to match."
   say "  ${SOURCE} is not touched."
 
   confirm "Create the profile(s) above?" || { say "aborted: nothing was changed."; return 1; }
 
+  # Normally a no-op (apply made the shared file); after a hand-made or
+  # interrupted setup it seeds it from the template, so the links resolve.
+  seed_claude_md
   for n in $new; do
     make_profile "$(profile_dir "$n")" "$n" "no"
   done
@@ -3409,6 +3963,11 @@ banner() {
     say "  layout                  : hub (${SHARED} links into ${HUB}, which"
     say "                            Claude Desktop reads; finalize refuses)"
   fi
+  if [ "$CLAUDE_MD" = "shared" ]; then
+    say "  CLAUDE.md               : shared (one file, ${SHARED}/CLAUDE.md)"
+  else
+    say "  CLAUDE.md               : copied (one copy per profile)"
+  fi
 }
 
 build_profiles() {
@@ -3514,6 +4073,11 @@ case "$CMD" in
     DRY=0
     banner
     do_remove "$CMD_ARG"
+    ;;
+  claude-md)
+    DRY=0
+    banner
+    do_claude_md "$CMD_ARG"
     ;;
   finalize)
     DRY=0

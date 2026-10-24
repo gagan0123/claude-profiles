@@ -1141,6 +1141,207 @@ HOME="$H14" bash "$SCRIPT" verify > "$T/std-broken.out" 2>&1; rc=$?
 check "standard: verify reports a broken link inside ~/.claude-shared" "[ $rc -ne 0 ] && grep -qF 'broken: $H14/.claude-shared/plans -> $T/nowhere, which does not exist' $T/std-broken.out"
 check "standard: an unrelated link does not switch the layout to hub" "! grep -q 'layout                  : hub' $T/std-broken.out"
 
+echo "=== CLAUDE.md: shared vs copied ==="
+# --claude-md shared keeps one CLAUDE.md at ~/.claude-shared/CLAUDE.md with a
+# link in every profile; copied (the default, and what every version before
+# did) gives each profile its own copy. The claude-md command switches an
+# existing setup either way. Fake HOMEs of their own throughout.
+H15="$T/home_md"
+mkdir -p "$H15/.claude/projects/-md-proj" "$H15/.claude/plans"
+printf '{"type":"user","msg":"md"}\n' > "$H15/.claude/projects/-md-proj/s1.jsonl"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H15/.claude/settings.json"
+printf '# machine facts\n- fact one\n' > "$H15/.claude/CLAUDE.md"
+printf '{"claudeAiOauth":{"accessToken":"FAKE"}}\n' > "$H15/.claude/.credentials.json"; chmod 600 "$H15/.claude/.credentials.json"
+printf '{"hasCompletedOnboarding":true}\n' > "$H15/.claude.json"
+printf 'export PATH=$PATH\n' > "$H15/.bashrc"
+mdsnap() { (cd "$1" && find .claude .claude.json -exec ls -ld {} + | sort | cksum); }
+md_before=$(mdsnap "$H15")
+MDS="$H15/.claude-shared/CLAUDE.md"
+MDCONF="$H15/.claude-shared/.claude-profiles.conf"
+
+HOME="$H15" bash "$SCRIPT" plan --profiles a,b > "$T/md-plan-default.out" 2>&1; rc=$?
+check "md: plan without the flag says copied and offers --claude-md shared" "[ $rc -eq 0 ] && grep -q 'CLAUDE.md: copied' $T/md-plan-default.out && grep -q -- '--claude-md shared keeps the file' $T/md-plan-default.out"
+HOME="$H15" bash "$SCRIPT" plan --profiles a,b --claude-md shared > "$T/md-plan.out" 2>&1; rc=$?
+check "md: plan --claude-md shared previews the seed and the links" "[ $rc -eq 0 ] && grep -q 'CLAUDE.md: shared' $T/md-plan.out && grep -qF 'seed   CLAUDE.md <- $H15/.claude/CLAUDE.md' $T/md-plan.out && grep -qF 'link   CLAUDE.md -> $MDS' $T/md-plan.out"
+check "md: plan created nothing" "[ ! -e $H15/.claude-shared ] && [ ! -e $H15/.claude-a ] && [ '$md_before' = \"\$(mdsnap $H15)\" ]"
+HOME="$H15" bash "$SCRIPT" plan --profiles a,b --claude-md nope >/dev/null 2>&1; check "md: rejects a bad --claude-md value" "[ $? -ne 0 ]"
+
+HOME="$H15" bash "$SCRIPT" apply --yes --shell --profiles a,b --claude-md shared > "$T/md-apply.out" 2>&1; rc=$?
+check "md: apply --claude-md shared exits 0" "[ $rc -eq 0 ]"
+check "md: the shared file is a real copy of the source's" "[ -f $MDS ] && [ ! -L $MDS ] && cmp -s $MDS $H15/.claude/CLAUDE.md && [ ! -e $H15/.claude-shared/.CLAUDE.md.partial ]"
+check "md: every profile's CLAUDE.md is a link to the shared file, absolute" "[ \"\$(readlink $H15/.claude-a/CLAUDE.md)\" = $MDS ] && [ \"\$(readlink $H15/.claude-b/CLAUDE.md)\" = $MDS ] && grep -q 'fact one' $H15/.claude-b/CLAUDE.md"
+check "md: conf records CLAUDE_MD=shared" "grep -q '^CLAUDE_MD=shared\$' $MDCONF"
+check "md: source untouched by apply" "[ '$md_before' = \"\$(mdsnap $H15)\" ]"
+check "md: settings.json still excludes the ancestor file" "grep -qF '\"$H15/.claude/CLAUDE.md\"' $H15/.claude-a/settings.json"
+HOME="$H15" bash "$SCRIPT" apply --yes --no-backup > "$T/md-apply2.out" 2>&1; rc=$?
+check "md: re-apply without the flag reads shared from the conf and skips what exists" "[ $rc -eq 0 ] && grep -q 'keep   CLAUDE.md (already in shared dir' $T/md-apply2.out && grep -q 'link   CLAUDE.md (already linked)' $T/md-apply2.out && [ -L $H15/.claude-a/CLAUDE.md ]"
+HOME="$H15" bash "$SCRIPT" apply --yes --no-backup --claude-md shared > "$T/md-apply3.out" 2>&1; rc=$?
+check "md: re-apply with the same flag is accepted" "[ $rc -eq 0 ]"
+HOME="$H15" bash "$SCRIPT" apply --yes --no-backup --claude-md copied > "$T/md-apply-conflict.out" 2>&1; rc=$?
+check "md: re-apply with a conflicting --claude-md is refused and names the claude-md command" "[ $rc -ne 0 ] && grep -q 'records CLAUDE_MD=shared' $T/md-apply-conflict.out && grep -q 'claude-md copied' $T/md-apply-conflict.out"
+check "md: the refused apply changed nothing" "[ -L $H15/.claude-a/CLAUDE.md ] && grep -q '^CLAUDE_MD=shared\$' $MDCONF"
+HOME="$H15" bash "$SCRIPT" plan --claude-md copied > "$T/md-plan-conflict.out" 2>&1; rc=$?
+check "md: plan with a conflicting --claude-md is refused too" "[ $rc -ne 0 ] && grep -q 'claude-md copied' $T/md-plan-conflict.out"
+
+HOME="$H15" bash "$SCRIPT" add c --yes > "$T/md-add.out" 2>&1; rc=$?
+check "md: add honours the recorded shared mode" "[ $rc -eq 0 ] && [ \"\$(readlink $H15/.claude-c/CLAUDE.md)\" = $MDS ] && grep -q 'CLAUDE.md is shared' $T/md-add.out"
+HOME="$H15" bash "$SCRIPT" add d --yes --claude-md copied > "$T/md-add-conflict.out" 2>&1; rc=$?
+check "md: add with a conflicting --claude-md is refused" "[ $rc -ne 0 ] && [ ! -e $H15/.claude-d ] && grep -q 'claude-md copied' $T/md-add-conflict.out"
+
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify1.out" 2>&1; rc=$?
+check "md: verify clean, with a CLAUDE.md section" "[ $rc -eq 0 ] && grep -q '^CLAUDE.md\$' $T/md-verify1.out && grep -qF '$MDS is the one real file' $T/md-verify1.out && grep -qF 'c: CLAUDE.md -> $MDS' $T/md-verify1.out"
+HOME="$H15" bash "$SCRIPT" verify --json > "$T/md-verify1.json" 2>/dev/null; rc=$?
+check "md: verify --json has the CLAUDE.md section and is clean" "[ $rc -eq 0 ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); s=[x for x in d[\"sections\"] if x[\"name\"]==\"CLAUDE.md\"]; sys.exit(0 if d[\"ok\"] is True and len(s)==1 and any(i[\"level\"]==\"ok\" for i in s[0][\"items\"]) else 1)' $T/md-verify1.json"
+HOME="$H15" bash "$SCRIPT" status > "$T/md-status.out" 2>&1; rc=$?
+check "md: status has the CLAUDE.md line" "[ $rc -eq 0 ] && grep -q 'CLAUDE.md: shared' $T/md-status.out"
+HOME="$H15" bash "$SCRIPT" status --json > "$T/md-status.json" 2>/dev/null
+check "md: status --json .shared.claude_md is shared" "python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))[\"shared\"][\"claude_md\"]==\"shared\" else 1)' $T/md-status.json"
+
+# Deliberately broken, three ways.
+mv "$MDS" "$T/md-shared.keep"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-dangling.out" 2>&1; rc=$?
+check "md: verify fails on a missing shared file and dangling links" "[ $rc -ne 0 ] && grep -qF 'missing: $MDS' $T/md-verify-dangling.out && grep -q 'a: CLAUDE.md is a dangling link' $T/md-verify-dangling.out"
+mv "$T/md-shared.keep" "$MDS"
+rm "$H15/.claude-b/CLAUDE.md"; ln -s "$H15/.claude/CLAUDE.md" "$H15/.claude-b/CLAUDE.md"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-wrong.out" 2>&1; rc=$?
+check "md: verify fails on a link to the wrong target" "[ $rc -ne 0 ] && grep -qF \"b: CLAUDE.md points at '$H15/.claude/CLAUDE.md', expected '$MDS'\" $T/md-verify-wrong.out"
+HOME="$H15" bash "$SCRIPT" claude-md shared --yes > "$T/md-cmd-elsewhere.out" 2>&1; rc=$?
+check "md: claude-md shared refuses a link to somewhere else rather than replace it" "[ $rc -ne 0 ] && grep -q 'not to' $T/md-cmd-elsewhere.out && [ \"\$(readlink $H15/.claude-b/CLAUDE.md)\" = $H15/.claude/CLAUDE.md ]"
+rm "$H15/.claude-b/CLAUDE.md"; cp -p "$H15/.claude/CLAUDE.md" "$H15/.claude-b/CLAUDE.md"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-real.out" 2>&1; rc=$?
+check "md: a real file in shared mode is a warning with the fix, not a failure" "[ $rc -eq 0 ] && grep -q 'b: CLAUDE.md is a real file, not a link' $T/md-verify-real.out && grep -q 'claude-md shared' $T/md-verify-real.out && grep -q 'no problems found' $T/md-verify-real.out"
+n_md_tars=$(find "$H15/.claude-backups" -maxdepth 1 -name 'claude-md-*.tar.gz' | wc -l | tr -d ' ')
+HOME="$H15" bash "$SCRIPT" claude-md shared --yes > "$T/md-cmd-fix.out" 2>&1; rc=$?
+check "md: claude-md shared relinks the stray copy after archiving it" "[ $rc -eq 0 ] && [ \"\$(readlink $H15/.claude-b/CLAUDE.md)\" = $MDS ] && grep -q 'a: already a link' $T/md-cmd-fix.out && [ \$(find $H15/.claude-backups -maxdepth 1 -name 'claude-md-*.tar.gz' | wc -l | tr -d ' ') -eq $((n_md_tars+1)) ]"
+MD_TAR1=$(find "$H15/.claude-backups" -maxdepth 1 -name 'claude-md-*.tar.gz' | head -1)
+check "md: that archive holds only the stray copy" "[ -n '$MD_TAR1' ] && [ \$(tar tzf '$MD_TAR1' | wc -l | tr -d ' ') -eq 1 ] && tar tzf '$MD_TAR1' | grep -q '^\.claude-b/CLAUDE.md\$'"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-fixed.out" 2>&1; rc=$?
+check "md: verify clean again" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/md-verify-fixed.out"
+
+# Back to copied, and forth again with the copies differing.
+HOME="$H15" bash "$SCRIPT" claude-md copied --yes > "$T/md-copied.out" 2>&1; rc=$?
+check "md: claude-md copied exits 0" "[ $rc -eq 0 ]"
+check "md: every profile has its own real copy of the shared text" "[ -f $H15/.claude-a/CLAUDE.md ] && [ ! -L $H15/.claude-a/CLAUDE.md ] && [ ! -L $H15/.claude-b/CLAUDE.md ] && [ ! -L $H15/.claude-c/CLAUDE.md ] && cmp -s $H15/.claude-c/CLAUDE.md $MDS && [ ! -e $H15/.claude-c/.CLAUDE.md.partial ]"
+check "md: the shared file is left in place and said to be harmless" "[ -f $MDS ] && grep -q 'stays where it is: harmless' $T/md-copied.out"
+check "md: conf records CLAUDE_MD=copied" "grep -q '^CLAUDE_MD=copied\$' $MDCONF && [ \$(grep -c '^CLAUDE_MD=' $MDCONF) -eq 1 ]"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-copied.out" 2>&1; rc=$?
+check "md: verify clean in copied mode" "[ $rc -eq 0 ] && grep -q 'a: CLAUDE.md is its own copy' $T/md-verify-copied.out"
+HOME="$H15" bash "$SCRIPT" status > "$T/md-status2.out" 2>&1
+check "md: status line follows the switch" "grep -q 'CLAUDE.md: copied' $T/md-status2.out"
+HOME="$H15" bash "$SCRIPT" claude-md copied --yes > "$T/md-copied2.out" 2>&1; rc=$?
+check "md: a second claude-md copied is a no-op" "[ $rc -eq 0 ] && grep -q 'already has its own copy' $T/md-copied2.out"
+rm "$H15/.claude-a/CLAUDE.md"; ln -s "$MDS" "$H15/.claude-a/CLAUDE.md"
+HOME="$H15" bash "$SCRIPT" verify > "$T/md-verify-linkcopied.out" 2>&1; rc=$?
+check "md: a link while copied is recorded is a problem with both fixes named" "[ $rc -ne 0 ] && grep -q 'recorded mode is' $T/md-verify-linkcopied.out && grep -q 'claude-md shared' $T/md-verify-linkcopied.out"
+rm "$H15/.claude-a/CLAUDE.md"; cp -p "$MDS" "$H15/.claude-a/CLAUDE.md"
+
+printf -- '- fact two, fixed only in b\n' >> "$H15/.claude-b/CLAUDE.md"
+HOME="$H15" bash "$SCRIPT" claude-md shared --from b --yes > "$T/md-exists-differs.out" 2>&1; rc=$?
+check "md: an existing shared file that differs from --from's copy is refused, naming both" "[ $rc -ne 0 ] && grep -q 'already exists and differs from' $T/md-exists-differs.out && grep -qF -- '--from b' $T/md-exists-differs.out && [ ! -L $H15/.claude-b/CLAUDE.md ]"
+HOME="$H15" bash "$SCRIPT" claude-md shared --from nosuch --yes > "$T/md-from-bad.out" 2>&1; rc=$?
+check "md: --from with an unknown name is refused" "[ $rc -ne 0 ] && grep -q 'not one of the profiles' $T/md-from-bad.out"
+rm "$MDS"
+n_md_tars=$(find "$H15/.claude-backups" -maxdepth 1 -name 'claude-md-*.tar.gz' | wc -l | tr -d ' ')
+if ( exec </dev/tty ) 2>/dev/null; then
+  echo "SKIP claude-md-without-yes check (this run has a controlling terminal)"
+else
+  HOME="$H15" bash "$SCRIPT" claude-md shared --from b </dev/null > "$T/md-notty.out" 2>&1; rc=$?
+  check "md: differing copies without --yes and no tty: summary printed, then fails closed" "[ $rc -ne 0 ] && grep -q 'DIFFERS' $T/md-notty.out && grep -q 'identical to' $T/md-notty.out && grep -q -- '--yes' $T/md-notty.out"
+  check "md: the refused switch changed nothing" "[ ! -e $MDS ] && [ ! -L $H15/.claude-a/CLAUDE.md ] && grep -q '^CLAUDE_MD=copied\$' $MDCONF && [ \$(find $H15/.claude-backups -maxdepth 1 -name 'claude-md-*.tar.gz' | wc -l | tr -d ' ') -eq $n_md_tars ]"
+fi
+HOME="$H15" bash "$SCRIPT" claude-md shared --from b --yes > "$T/md-shared-from.out" 2>&1; rc=$?
+check "md: claude-md shared --from b exits 0" "[ $rc -eq 0 ] && grep -q 'DIFFERS' $T/md-shared-from.out"
+check "md: b's copy was promoted to the shared file" "[ -f $MDS ] && [ ! -L $MDS ] && grep -q 'fact two' $MDS"
+check "md: every profile links to it, so a reads b's fix" "[ \"\$(readlink $H15/.claude-a/CLAUDE.md)\" = $MDS ] && [ \"\$(readlink $H15/.claude-b/CLAUDE.md)\" = $MDS ] && [ \"\$(readlink $H15/.claude-c/CLAUDE.md)\" = $MDS ] && grep -q 'fact two' $H15/.claude-a/CLAUDE.md"
+MD_TAR=$(find "$H15/.claude-backups" -maxdepth 1 -name 'claude-md-*.tar.gz' ! -name "$(basename "$MD_TAR1")" | head -1)
+check "md: the archive holds all three real copies, mode 600" "[ -n '$MD_TAR' ] && [ \$(fmode '$MD_TAR') = 600 ] && [ \$(fmode $H15/.claude-backups) = 700 ] && tar tzf '$MD_TAR' | grep -q '^\.claude-a/CLAUDE.md\$' && tar tzf '$MD_TAR' | grep -q '^\.claude-b/CLAUDE.md\$' && tar tzf '$MD_TAR' | grep -q '^\.claude-c/CLAUDE.md\$'"
+mkdir -p "$T/md-restore" && tar xzf "$MD_TAR" -C "$T/md-restore"
+check "md: the archived copy of a is the text from before the switch" "! grep -q 'fact two' $T/md-restore/.claude-a/CLAUDE.md && grep -q 'fact one' $T/md-restore/.claude-a/CLAUDE.md"
+check "md: the archive path is printed with the rollback pointer" "grep -qF '$MD_TAR' $T/md-shared-from.out && grep -q 'ROLLBACK.md' $T/md-shared-from.out"
+check "md: conf records CLAUDE_MD=shared again, once" "grep -q '^CLAUDE_MD=shared\$' $MDCONF && [ \$(grep -c '^CLAUDE_MD=' $MDCONF) -eq 1 ]"
+check "md: source untouched by every command above" "[ '$md_before' = \"\$(mdsnap $H15)\" ]"
+
+# remove and rollback with links: the archive stores the link as a link, the
+# shared file is not followed into, and the source is never touched.
+HOME="$H15" bash "$SCRIPT" remove c --yes > "$T/md-remove.out" 2>&1; rc=$?
+MD_RM_TAR=$(find "$H15/.claude-backups" -maxdepth 1 -name 'claude-c-removed-*.tar.gz' | head -1)
+check "md: remove archives the profile's CLAUDE.md as a link and leaves the shared file" "[ $rc -eq 0 ] && tar tvzf '$MD_RM_TAR' | grep -q 'CLAUDE.md -> ' && [ -f $MDS ] && grep -q 'fact two' $MDS"
+HOME="$H15" bash "$SCRIPT" rollback --yes > "$T/md-rollback.out" 2>&1; rc=$?
+check "md: rollback with links exits 0 and names the claude-md archive" "[ $rc -eq 0 ] && grep -q 'claude-md-\*.tar.gz' $T/md-rollback.out"
+check "md: rollback removed the profiles and the shared dir, kept the archives" "[ ! -e $H15/.claude-a ] && [ ! -e $H15/.claude-b ] && [ ! -e $H15/.claude-shared ] && [ -f '$MD_TAR' ]"
+check "md: source untouched by remove and rollback" "[ '$md_before' = \"\$(mdsnap $H15)\" ] && grep -q 'fact one' $H15/.claude/CLAUDE.md"
+
+# The hand-made state: an older conf (no CLAUDE_MD line), the shared file
+# moved into place and every profile already linked. claude-md shared must
+# be a no-op apart from the conf line, and must not need a confirmation.
+H16="$T/home_md_hand"
+mkdir -p "$H16/.claude/plans"
+printf '{"cleanupPeriodDays": 3650}\n' > "$H16/.claude/settings.json"
+printf '# hand made\n' > "$H16/.claude/CLAUDE.md"
+printf 'export PATH=$PATH\n' > "$H16/.bashrc"
+HOME="$H16" bash "$SCRIPT" apply --yes --shell --profiles x,y > "$T/md-hand-apply.out" 2>&1
+check "md (hand): default apply still copies, and ~/.claude-shared/CLAUDE.md does not exist" "[ -f $H16/.claude-x/CLAUDE.md ] && [ ! -L $H16/.claude-x/CLAUDE.md ] && [ ! -e $H16/.claude-shared/CLAUDE.md ] && grep -q '^CLAUDE_MD=copied\$' $H16/.claude-shared/.claude-profiles.conf"
+grep -v '^CLAUDE_MD=' "$H16/.claude-shared/.claude-profiles.conf" > "$T/md-hand.conf" && mv "$T/md-hand.conf" "$H16/.claude-shared/.claude-profiles.conf"
+mv "$H16/.claude-x/CLAUDE.md" "$H16/.claude-shared/CLAUDE.md"; rm "$H16/.claude-y/CLAUDE.md"
+ln -s "$H16/.claude-shared/CLAUDE.md" "$H16/.claude-x/CLAUDE.md"; ln -s "$H16/.claude-shared/CLAUDE.md" "$H16/.claude-y/CLAUDE.md"
+HOME="$H16" bash "$SCRIPT" verify > "$T/md-hand-verify0.out" 2>&1; rc=$?
+check "md (hand): verify with no CLAUDE_MD line treats it as copied and flags the links" "[ $rc -ne 0 ] && grep -q 'treated as copied' $T/md-hand-verify0.out && grep -q 'recorded mode is' $T/md-hand-verify0.out"
+HOME="$H16" bash "$SCRIPT" apply --yes --no-backup --claude-md shared > "$T/md-hand-apply2.out" 2>&1; rc=$?
+check "md (hand): apply --claude-md shared on an older conf is refused, pointing at claude-md" "[ $rc -ne 0 ] && grep -q 'no CLAUDE_MD line' $T/md-hand-apply2.out && grep -q 'claude-md shared' $T/md-hand-apply2.out"
+hand_before=$(cd "$H16" && find .claude-x .claude-y .claude-shared/CLAUDE.md -exec ls -ld {} + | sort | cksum)
+HOME="$H16" bash "$SCRIPT" claude-md shared </dev/null > "$T/md-hand-cmd.out" 2>&1; rc=$?
+check "md (hand): claude-md shared is a no-op apart from the conf line, with no confirmation needed" "[ $rc -eq 0 ] && grep -q 'every profile already links' $T/md-hand-cmd.out && grep -q '^CLAUDE_MD=shared\$' $H16/.claude-shared/.claude-profiles.conf && [ '$hand_before' = \"\$(cd $H16 && find .claude-x .claude-y .claude-shared/CLAUDE.md -exec ls -ld {} + | sort | cksum)\" ] && [ -z \"\$(find $H16/.claude-backups -name 'claude-md-*' 2>/dev/null)\" ]"
+HOME="$H16" bash "$SCRIPT" verify > "$T/md-hand-verify1.out" 2>&1; rc=$?
+check "md (hand): verify clean afterwards" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/md-hand-verify1.out"
+HOME="$H16" bash "$SCRIPT" status --json > "$T/md-hand-status.json" 2>/dev/null
+check "md (hand): status --json reports shared" "python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))[\"shared\"][\"claude_md\"]==\"shared\" else 1)' $T/md-hand-status.json"
+
+# Hub layout: the shared CLAUDE.md is a real copy in ~/.claude-shared, never
+# a link into the hub, because ~/.claude/CLAUDE.md is the ancestor file every
+# profile excludes. The hub itself is left byte-identical.
+H17="$T/home_md_hub"
+mkhub "$H17"
+printf '# hub md\n' > "$H17/.claude/CLAUDE.md"
+# mkhub's early conf has no CLAUDE_MD line, which means copied, and apply
+# refuses to switch an existing record (checked above). Drop it: this is a
+# hub choosing shared up front, and the layout is still detected from the links.
+rm "$H17/.claude-shared/.claude-profiles.conf"
+hubmd_before=$(hubsnap "$H17"); hubmd_file_before=$(cd "$H17" && ls -ld .claude/CLAUDE.md)
+HOME="$H17" bash "$SCRIPT" apply --yes --shell --claude-md shared > "$T/md-hub-apply.out" 2>&1; rc=$?
+check "md (hub): apply --claude-md shared exits 0" "[ $rc -eq 0 ]"
+check "md (hub): the shared CLAUDE.md is a real copy, not a link into ~/.claude" "[ -f $H17/.claude-shared/CLAUDE.md ] && [ ! -L $H17/.claude-shared/CLAUDE.md ] && cmp -s $H17/.claude-shared/CLAUDE.md $H17/.claude/CLAUDE.md"
+check "md (hub): profiles link to the shared copy" "[ \"\$(readlink $H17/.claude-work/CLAUDE.md)\" = $H17/.claude-shared/CLAUDE.md ] && [ \"\$(readlink $H17/.claude-personal/CLAUDE.md)\" = $H17/.claude-shared/CLAUDE.md ]"
+check "md (hub): nothing in ~/.claude changed" "[ '$hubmd_before' = \"\$(hubsnap $H17)\" ] && [ \"\$(cd $H17 && ls -ld .claude/CLAUDE.md)\" = '$hubmd_file_before' ]"
+check "md (hub): conf records both LAYOUT=hub and CLAUDE_MD=shared" "grep -q '^LAYOUT=hub\$' $H17/.claude-shared/.claude-profiles.conf && grep -q '^CLAUDE_MD=shared\$' $H17/.claude-shared/.claude-profiles.conf"
+HOME="$H17" bash "$SCRIPT" verify > "$T/md-hub-verify.out" 2>&1; rc=$?
+check "md (hub): verify clean" "[ $rc -eq 0 ] && grep -q 'no problems found' $T/md-hub-verify.out"
+rm "$H17/.claude-shared/CLAUDE.md"; ln -s "$H17/.claude/CLAUDE.md" "$H17/.claude-shared/CLAUDE.md"
+HOME="$H17" bash "$SCRIPT" verify > "$T/md-hub-verify-link.out" 2>&1; rc=$?
+check "md (hub): a shared CLAUDE.md that links into ~/.claude is a problem" "[ $rc -ne 0 ] && grep -qF 'is a link into $H17/.claude' $T/md-hub-verify-link.out"
+HOME="$H17" bash "$SCRIPT" apply --yes --no-backup > "$T/md-hub-apply-link.out" 2>&1; rc=$?
+check "md (hub): apply refuses while that link is there, and changes nothing" "[ $rc -ne 0 ] && grep -q 'has to be a real file' $T/md-hub-apply-link.out && [ -L $H17/.claude-shared/CLAUDE.md ] && [ '$hubmd_before' = \"\$(hubsnap $H17)\" ]"
+HOME="$H17" bash "$SCRIPT" claude-md shared --yes > "$T/md-hub-cmd-link.out" 2>&1; rc=$?
+check "md (hub): claude-md shared refuses that link too" "[ $rc -ne 0 ] && grep -q 'must' $T/md-hub-cmd-link.out && [ -L $H17/.claude-shared/CLAUDE.md ]"
+rm "$H17/.claude-shared/CLAUDE.md"
+HOME="$H17" bash "$SCRIPT" apply --yes --no-backup > "$T/md-hub-apply-fix.out" 2>&1; rc=$?
+check "md (hub): with the link gone, apply copies the file in again" "[ $rc -eq 0 ] && [ -f $H17/.claude-shared/CLAUDE.md ] && [ ! -L $H17/.claude-shared/CLAUDE.md ] && [ '$hubmd_before' = \"\$(hubsnap $H17)\" ]"
+H18="$T/home_md_hubwhole"
+mkhub "$H18"
+rm -rf "$H18/.claude-shared"; ln -s "$H18/.claude" "$H18/.claude-shared"
+printf 'MAIN=work\nSECOND=personal\nSHARE_MODE=full\n' > "$H18/.claude/.claude-profiles.conf"
+HOME="$H18" bash "$SCRIPT" apply --yes --claude-md shared > "$T/md-hubw-apply.out" 2>&1; rc=$?
+check "md (hub, whole dir): --claude-md shared is refused" "[ $rc -ne 0 ] && grep -q 'not possible while' $T/md-hubw-apply.out && [ ! -e $H18/.claude-work/CLAUDE.md ]"
+HOME="$H18" bash "$SCRIPT" claude-md shared --yes > "$T/md-hubw-cmd.out" 2>&1; rc=$?
+check "md (hub, whole dir): claude-md shared is refused" "[ $rc -ne 0 ] && grep -q 'not possible while' $T/md-hubw-cmd.out"
+HOME="$H18" bash "$SCRIPT" apply --yes > "$T/md-hubw-apply2.out" 2>&1; rc=$?
+check "md (hub, whole dir): copied still works there" "[ $rc -eq 0 ] && grep -q '^CLAUDE_MD=copied\$' $H18/.claude/.claude-profiles.conf"
+
+# The default is unchanged: the main fixture's apply never made a shared file.
+check "md: the default stays copied (main fixture conf)" "grep -q '^CLAUDE_MD=copied\$' $T/home/.claude-shared/.claude-profiles.conf"
+HOME="$H15" bash "$SCRIPT" claude-md >/dev/null 2>&1; check "md: claude-md without a mode is rejected" "[ $? -ne 0 ]"
+HOME="$H15" bash "$SCRIPT" claude-md shared --claude-md shared >/dev/null 2>&1; check "md: claude-md rejects the --claude-md flag" "[ $? -ne 0 ]"
+HOME="$H15" bash "$SCRIPT" verify --from a >/dev/null 2>&1; check "md: --from is rejected on other commands" "[ $? -ne 0 ]"
+
 echo
 echo "passed=$pass failed=$fail   (outputs in $T)"
 [ "$fail" -eq 0 ]

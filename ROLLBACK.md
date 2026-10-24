@@ -84,8 +84,17 @@ where it was. Move anything currently at that path aside first. Extract it
 *before* rollback if you want to keep working with those sessions, or
 afterwards to recover them.
 
+**If `CLAUDE.md` is shared** (`CLAUDE_MD=shared` in the conf, or
+`CLAUDE.md: shared` in `status`), the one real copy is
+`~/.claude-shared/CLAUDE.md` and goes with that directory; the profiles'
+entries are only links to it and rollback does not follow them. `~/.claude`
+still has the file it was copied from. If the profiles ever had copies of
+their own, those are in `~/.claude-backups/claude-md-<timestamp>.tar.gz`
+(see "Undoing `claude-md shared`" below).
+
 **In the hub layout** (README, "Hub layout") `~/.claude-shared` holds only
-links into `~/.claude`, so rollback removes the links and the shared data
+links into `~/.claude` (plus, with `CLAUDE_MD=shared`, the real
+`CLAUDE.md` copy), so rollback removes the links and the shared data
 stays in `~/.claude`. Shared paths that `apply` created there empty stay too.
 If `~/.claude-shared` is itself one link to `~/.claude`, rollback refuses,
 because it resolves to the source; remove that link yourself with
@@ -120,6 +129,44 @@ one over, the previous `settings.json` is still at
 `settings.json.pre-statusline-<timestamp>` next to it; copy its
 `statusLine` back by hand if you want it. Level 2 needs none of this: it
 deletes `~/.claude-shared` and the profiles, status line included.
+
+---
+
+## Undoing `claude-md shared`
+
+`claude-md shared` archives every profile's real `CLAUDE.md` before
+replacing it with a link, to
+`~/.claude-backups/claude-md-<timestamp>.tar.gz`, as paths relative to your
+home directory (`.claude-work/CLAUDE.md`, `.claude-personal/CLAUDE.md`,
+...). Only profiles that still had a real copy are in it; one that was
+already a link was skipped and is not.
+
+The mild way back is the command's own opposite:
+
+```bash
+./claude-profiles.sh claude-md copied
+```
+
+That replaces each link with a copy of the *shared* text, which is the
+promoted copy, not what each profile had before. If the copies differed and
+you want each profile's own text back, extract the archive instead. Quit
+every Claude Code session first:
+
+```bash
+ls -la ~/.claude-backups/claude-md-*.tar.gz
+tar tzf ~/.claude-backups/claude-md-<timestamp>.tar.gz        # see what is in it
+./claude-profiles.sh claude-md copied --yes                     # links become copies, conf says copied
+tar xzf ~/.claude-backups/claude-md-<timestamp>.tar.gz -C "$HOME"   # the old texts over those copies
+./claude-profiles.sh verify
+```
+
+Run `claude-md copied` *before* the `tar xzf`: extracting straight over a
+symlink would write through the link into `~/.claude-shared/CLAUDE.md`
+rather than replace the link, and the conf would still say `shared`. To
+restore just one profile's text, add its path to the `tar xzf` line, for
+example `.claude-work/CLAUDE.md`. `~/.claude-shared/CLAUDE.md` is left
+behind in either case and is harmless; delete it by hand if you want.
+`~/.claude` was not involved at any point.
 
 ---
 

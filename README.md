@@ -12,7 +12,7 @@ Contents of this bundle:
 
 | File | What it is |
 |---|---|
-| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback`, `finalize`, `add`, `remove`, `status` and `statusline` modes. |
+| `claude-profiles.sh` | The setup script. Has `plan`, `apply` (with `--adopt`), `verify`, `rollback`, `finalize`, `add`, `remove`, `claude-md`, `status` and `statusline` modes. |
 | `statusline.sh` | An optional Claude Code status line that shows which profile a session is in. Installed only by `./claude-profiles.sh statusline`, never by `apply`. |
 | `README.md` | This file. Read it before running anything. |
 | `INSTRUCTIONS-FOR-CLAUDE.md` | Paste this into Claude Code on the target machine and let it drive. |
@@ -99,6 +99,10 @@ Useful options:
 --share safe     do NOT share transcripts, see below
 --layout hub     keep the shared data in ~/.claude for Claude Desktop, see
                  "Hub layout" below (default: standard, or what is detected)
+--claude-md shared
+                 one CLAUDE.md for every profile, at ~/.claude-shared/CLAUDE.md,
+                 linked from each; default is copied (one copy per profile,
+                 free to diverge), see "One CLAUDE.md or one per profile" below
 --source DIR     seed from a profile other than ~/.claude
 --shell          append the source line to your .zshrc / .bashrc for you
 --no-backup      skip the tar archive (only sensible on a re-run of apply; for
@@ -115,9 +119,13 @@ Useful options:
 combining them with `--profiles` is an error.
 
 `--profiles` (recorded as `PROFILES=name,name,...`), `--share`, `--layout`
-(recorded as `LAYOUT=standard` or `LAYOUT=hub`) and `--source` are remembered in `~/.claude-shared/.claude-profiles.conf` after `apply`, so
-`verify` and `rollback` use the same values without you repeating them.
-Explicit flags always win.
+(recorded as `LAYOUT=standard` or `LAYOUT=hub`), `--claude-md` (recorded as
+`CLAUDE_MD=copied` or `CLAUDE_MD=shared`) and `--source` are remembered in
+`~/.claude-shared/.claude-profiles.conf` after `apply`, so `verify`,
+`rollback`, `add` and `status` use the same values without you repeating
+them. Explicit flags always win, with one exception: a `--claude-md` that
+differs from the recorded value is refused, because converting a setup is
+the `claude-md` command's job (see "Day to day").
 
 ---
 
@@ -150,7 +158,9 @@ instead of the fuller `verify`.
 Creates `~/.claude-acme` with its own fresh browser login, copies
 `settings.json` and `CLAUDE.md` from `~/.claude` if it still exists (or from
 the first profile in `PROFILES` if it does not -- see "Things that will
-surprise you" below), links it into the shared data, appends `acme` to
+surprise you" below; with `CLAUDE_MD=shared` recorded, `CLAUDE.md` is a
+link to `~/.claude-shared/CLAUDE.md` instead of a copy), links it into the
+shared data, appends `acme` to
 `PROFILES` in the conf file, and regenerates the launcher snippet so
 `claude-acme` exists in a new shell. `add` also takes a comma-separated list
 to create several profiles in one call, and `--settings acme=PATH` to seed
@@ -192,6 +202,48 @@ cp ~/.claude/settings.json .tmp/acme-settings.json
 It is ignored for a profile that already has a `settings.json` -- re-running
 `apply` never overwrites one -- is not recorded in the conf file, and does
 not support a path containing spaces.
+
+### `claude-md shared` and `claude-md copied`
+
+```bash
+./claude-profiles.sh claude-md shared              # promote the first profile's copy
+./claude-profiles.sh claude-md shared --from acme  # promote acme's copy instead
+./claude-profiles.sh claude-md copied              # back to one copy per profile
+```
+
+Switches a setup that already exists between the two ways of holding the
+user-level `CLAUDE.md` (see "One CLAUDE.md or one per profile" below).
+`apply` never does this conversion, because it never replaces a `CLAUDE.md`
+that is already in a profile; passing a `--claude-md` that differs from the
+recorded `CLAUDE_MD=` is refused and points here.
+
+`claude-md shared` first archives every profile's real `CLAUDE.md` to
+`~/.claude-backups/claude-md-<timestamp>.tar.gz` (mode 600, read back with
+`tar tzf` before anything else happens, like every other archive the script
+takes), then promotes one copy to `~/.claude-shared/CLAUDE.md` -- the first
+profile's unless `--from NAME` says otherwise -- and replaces each real copy
+with a symlink to it. If `~/.claude-shared/CLAUDE.md` already exists it is
+kept, and the `--from` copy has to be byte-identical to it or the command
+refuses rather than pick. If the profiles' copies differ from each other it
+says so per profile (line counts, identical or differs) before the
+confirmation, because only the promoted text survives outside the archive;
+diff them first if in doubt. A profile already linked to the shared file is
+skipped, so on a setup linked by hand the command changes nothing but the
+conf line, and asks nothing. A link to anywhere else, or a `CLAUDE.md` that
+is neither a file nor a link, is refused rather than converted.
+
+`claude-md copied` replaces each link with a real copy of the shared file
+(`cp -p` through a temp name, so an interrupted run leaves either the link or
+the copy, never half a file). `~/.claude-shared/CLAUDE.md` is left where it
+is: once no link points at it nothing reads it, so it is harmless, and you
+can delete it by hand.
+
+Both record the result as `CLAUDE_MD=` in the conf file and fail closed
+without `--yes` when there is no terminal, like every other mutating
+command. Neither has a dry run of its own: everything either will do is
+printed before the single confirmation, so a run without `--yes` is the
+preview. `~/.claude` is never touched. The way back is in `ROLLBACK.md`,
+"Undoing `claude-md shared`".
 
 ### `statusline` (optional)
 
@@ -285,7 +337,9 @@ at a single shared location.
                          done, project trust, user-scope MCP servers
   settings.json          real file, copied from ~/.claude at setup, plus a
                          claudeMdExcludes entry for ~/.claude/CLAUDE.md
-  CLAUDE.md              real file, copied from ~/.claude at setup
+  CLAUDE.md              real file, copied from ~/.claude at setup (default,
+                         --claude-md copied); with --claude-md shared it is
+                         a symlink to ~/.claude-shared/CLAUDE.md instead
   projects   ──┐         symlink
   history.jsonl┤         symlink
   skills       ┤         symlink
@@ -300,8 +354,11 @@ at a single shared location.
   ...          │
                │
 ~/.claude-shared ◄──────┘  the single real copy of everything shared
-  .claude-profiles.conf    records the names and sharing mode you chose, so
-                           verify and rollback do not need the flags again
+  CLAUDE.md                only with --claude-md shared: the one real
+                           CLAUDE.md, copied once from ~/.claude
+  .claude-profiles.conf    records the names, sharing mode, layout and
+                           CLAUDE.md mode you chose, so verify and rollback
+                           do not need the flags again
 ```
 
 That is the **standard layout**. If you also use the Claude Desktop app,
@@ -499,6 +556,58 @@ storage").
 
 ---
 
+## One CLAUDE.md or one per profile
+
+The second decision, smaller but worth making on purpose. With
+`CLAUDE_CONFIG_DIR` set, your user-level instructions come from the
+profile's own `CLAUDE.md`, so each profile has one. The script can hold it
+two ways:
+
+**`--claude-md copied`** (default, and what every version up to 2.3.0 did):
+each profile gets its own copy of `~/.claude/CLAUDE.md` once, at `apply` or
+`add`, and from then on they are independent files. Right when the profiles
+really do want different instructions -- a work profile with a client's
+conventions, a personal one without.
+
+**`--claude-md shared`**: one real file, `~/.claude-shared/CLAUDE.md`,
+copied once from `~/.claude/CLAUDE.md` (never overwritten afterwards, and
+created empty if the source had none), and every profile's `CLAUDE.md` is a
+symlink to it, by absolute path. Right when the file is machine facts and
+working rules that have to be the same everywhere: with copies, a fact
+fixed in one profile silently does not reach the others, and nothing
+reports the drift. That is the case this option exists for. The usual
+sharing caveat applies in reverse: an instruction you would not want one
+account to see does not belong in a shared file.
+
+The choice is recorded as `CLAUDE_MD=` in the conf file, `add` follows it,
+and `verify` has a "CLAUDE.md" section that checks it: in shared mode, that
+`~/.claude-shared/CLAUDE.md` is a real file and each profile's `CLAUDE.md` is
+a link to exactly that path (a broken or wrong-target link is a problem; a
+real file is a warning with the fix); in copied mode, that each is a real
+file (a link is a problem, with both ways out named). `status` prints the
+mode on one line, and `--json` carries it as `shared.claude_md`. An existing
+setup is switched with the `claude-md` command ("Day to day"), never by
+re-running `apply` with the other flag, which is refused.
+
+In the **hub layout** the shared `CLAUDE.md` is still a real copy in
+`~/.claude-shared`, not a link into `~/.claude` like the other shared
+entries. `~/.claude/CLAUDE.md` is the ancestor file every profile names in
+`claudeMdExcludes` (see "Things that will surprise you"); a profile whose
+own `CLAUDE.md` resolved to that same path would have its user file be the
+file it excludes, and whether `claudeMdExcludes` matches the spelled path or
+the resolved one is not documented. A separate copy keeps the hub rule
+(nothing in `~/.claude` is written) and leaves `~/.claude/CLAUDE.md` to
+Claude Desktop, which reads it as its own user file; the two can drift,
+exactly as the per-profile copies could before, and `verify` reports a
+`~/.claude-shared/CLAUDE.md` that is a link into the hub as a problem. The
+one hub shape where this cannot work is `~/.claude-shared` being itself a
+single link to `~/.claude`: there the shared file would *be*
+`~/.claude/CLAUDE.md`, so `--claude-md shared` and `claude-md shared` are
+refused on that shape with a message saying so; use a `~/.claude-shared`
+that is a directory of links, or keep `copied`.
+
+---
+
 ## Hub layout (Claude Desktop)
 
 The standard layout moves the shared data's home to `~/.claude-shared` and,
@@ -557,6 +666,10 @@ something the script does.
   data** is left alone and reported: see the repair below.
 - `statusLine`, hook and command paths under `~/.claude/` are left as they
   are rather than relocated, because `~/.claude` stays.
+- `--claude-md shared` still makes `~/.claude-shared/CLAUDE.md` a real copy
+  of `~/.claude/CLAUDE.md`, never a link into the hub, and is refused when
+  `~/.claude-shared` is itself one link to `~/.claude`. Why: "One CLAUDE.md
+  or one per profile".
 - `--adopt` is refused, since it would merge data into `~/.claude`.
 - **`finalize` always refuses**, before its first gate, whether the layout
   was detected, recorded or asked for. Here `~/.claude` is not a spare copy;
@@ -607,7 +720,8 @@ dangles, which is why sessions have to be closed first.
 | `.claude.json` | Holds the OAuth session, per-project trust decisions, and user-scope MCP servers. Sharing it would share the login. The profile that inherited your login gets a *copy* of `~/.claude.json` so it inherits trust decisions and MCP servers; every other, fresh profile starts empty. |
 | `sessions/` | One file per running session, used for live-session detection and crash cleanup. Sharing it lets one profile clean up the other's running session. |
 | `backups/` | Rolling copies of that profile's own `.claude.json`. Meaningless if shared. |
-| `settings.json`, `CLAUDE.md` | Copied once into each profile, then free to diverge. Your work profile may have org-specific permissions or env you do not want in personal. |
+| `settings.json` | Copied once into each profile, then free to diverge. Your work profile may have org-specific permissions or env you do not want in personal. |
+| `CLAUDE.md` | By default (`--claude-md copied`) the same: copied once, then free to diverge. With `--claude-md shared` it is the one exception to this table: one real file at `~/.claude-shared/CLAUDE.md`, linked from every profile. See "One CLAUDE.md or one per profile". |
 
 `verify` checks that `.credentials.json`, `.claude.json` and `sessions/` are
 real files or directories in each profile, never symlinks, and that nothing
@@ -666,7 +780,9 @@ touched). A profile that already has its own `claudeMdExcludes` is not
 edited: add the path to that array by hand. `verify` checks every profile
 while the file exists. The entry names a path under `~/.claude` on purpose,
 so it is not relocated and does not count as a reference that blocks
-`finalize`; after `finalize` it matches nothing and is harmless.
+`finalize`; after `finalize` it matches nothing and is harmless. This is
+also why a shared `CLAUDE.md` is always a copy in `~/.claude-shared` and
+never a link to `~/.claude/CLAUDE.md`, even in the hub layout.
 
 **IDE extensions do not know about profiles.** The VS Code and JetBrains
 extensions launch and discover Claude Code without your shell functions, so
@@ -694,7 +810,9 @@ checks this and complains if any profile differs. Same trap applies to
 Once `~/.claude` is gone there is nothing at the old location to copy
 `settings.json` and `CLAUDE.md` from, so a later
 `./claude-profiles.sh add newclient` copies them from whichever profile is
-listed first in `PROFILES` instead. Edit the new profile's `settings.json`
+listed first in `PROFILES` instead (with `CLAUDE_MD=shared`, `CLAUDE.md` is
+simply linked to the shared file and nothing is copied for it). Edit the
+new profile's `settings.json`
 by hand afterwards if the first profile's settings do not fit the new one,
 or pass `--settings newclient=PATH` on the same `add` command to do it in
 one step.

@@ -152,8 +152,19 @@ updating a stale copy, a profile added afterwards pointed at the command
 by `add` and taken over with `--replace`, `--remove`) plus `statusline.sh` itself fed JSON:
 profile name, Remote Control from a fake session file, warning marks, PR
 link, narrow widths, `NO_COLOR`, and malformed or hostile input. The
-statusline checks are skipped when jq is not installed. It never reads or writes the real
-`~/.claude`.
+statusline checks are skipped when jq is not installed. It also covers the
+`CLAUDE.md` modes (`--claude-md shared` on a standard layout: the shared
+file seeded once, absolute links in every profile, `CLAUDE_MD=` recorded,
+`add` following it, a re-apply idempotent and a conflicting flag refused on
+`plan`, `apply` and `add`; the default unchanged; `claude-md copied` and
+`claude-md shared` both ways including the archive, `--from`, the refusal
+when the shared file exists and differs, the fail-closed confirmation when
+the copies differ, and the hand-linked no-op; `verify`'s section clean and
+broken by a dangling link, a wrong target, a real file in shared mode and a
+link in copied mode; the `status` line and the `--json` shapes; `remove`
+and `rollback` with links; the hub layout keeping a real copy, refusing a
+link into the hub, and refusing the whole-directory hub shape). It never
+reads or writes the real `~/.claude`.
 
 Every behavioural change to the script needs a check in that file. If you
 fix a bug, add the case that would have caught it first.

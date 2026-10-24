@@ -87,11 +87,26 @@ sentences. `full` shares transcripts and gives cross-account `--resume`;
 `safe` keeps transcripts per-account for confidentiality reasons. Do not
 pick either for them.
 
+Then ask, once, whether their user-level `CLAUDE.md` should be **the same
+file across every profile** or **free to differ** per profile. If
+`~/.claude/CLAUDE.md` does not exist, skip the question and use `copied`.
+Otherwise summarise the README's "One CLAUDE.md or one per profile" in two
+sentences: `shared` keeps one file at `~/.claude-shared/CLAUDE.md` that
+every profile links to, so a fact fixed in one profile is fixed in all;
+`copied` gives each profile its own copy, which is right when the profiles
+want different instructions, and is what happened silently before this
+option existed. Their answer becomes `--claude-md shared` or
+`--claude-md copied` on every `plan` and `apply` below. Do not pick for
+them, and do not change the choice later by re-running `apply` with the
+other flag: the script refuses that, and the `claude-md` command is the
+supported way to switch (only when the user asks for it, since it
+rewrites every profile's `CLAUDE.md` after archiving the copies).
+
 **Step 3. Dry run.**
 
 ```bash
 chmod +x ./claude-profiles.sh
-./claude-profiles.sh plan --profiles <their list> --share <their choice>
+./claude-profiles.sh plan --profiles <their list> --share <their choice> --claude-md <their choice>
 ```
 
 Always pass `--profiles` explicitly, even for the easy setup (`work,personal`):
@@ -126,7 +141,7 @@ never `/logout`.
 **Step 4. Apply.** Only after the approval in Step 3:
 
 ```bash
-./claude-profiles.sh apply --profiles <their list> --share <their choice> --shell --yes
+./claude-profiles.sh apply --profiles <their list> --share <their choice> --claude-md <their choice> --shell --yes
 ```
 
 Add `--adopt` to that command if, and only if, Step 3 turned up pre-existing
@@ -192,6 +207,13 @@ project instructions in every project under the home directory. Re-run
 had its own `claudeMdExcludes`, tell the user to add the exact path that
 the warning prints to that array by hand.
 
+The "CLAUDE.md" section checks the choice from Step 2 against what is on
+disk: with `shared`, that `~/.claude-shared/CLAUDE.md` is a real file and
+every profile's `CLAUDE.md` is a link to it; with `copied`, that each is a
+real file. A broken or wrong-target link is a problem; a stray real copy in
+shared mode is only a warning, and the fix it names (`claude-md shared`)
+is a mutating command, so report it and ask rather than run it.
+
 Quote the "Accounts" section back to the user: it names which email and
 organization each launched profile is actually logged in as, which is the
 only real proof that no two profiles hold the same account. The same email
@@ -216,6 +238,10 @@ profile should be listed. If it is not, check that
 - the two live traps: keep `cleanupPeriodDays` identical in both
   `settings.json` files, and never resume the same session in two profiles
   at once
+- which `CLAUDE.md` mode they chose, and what it means day to day: with
+  `shared`, editing `CLAUDE.md` in any profile edits the one file all of
+  them read; with `copied`, each profile's copy is its own and a change
+  has to be made in each
 - that user-scope MCP servers and per-project trust carried over into the
   main profile but not the second, which needs them set up once
 - whether `verify` warned about settings pointing at `~/.claude`, and that
